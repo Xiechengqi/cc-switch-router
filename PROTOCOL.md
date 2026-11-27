@@ -49,7 +49,9 @@ Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请
 
 Client 公钥与 installationId 的映射持久化在 `client_identities`，普通离线清理只回收运行记录、连接和缓存，不回收身份或域名预留。原密钥签名重新注册恢复原 ID、已验证 Owner 和原子域名。重建运行记录时签发并持久化新的 controlSecret，不恢复旧会话；重复注册取得同一已落库结果。响应可追加 `previousInstallationIds`：仅用于已审计的历史身份修复，Server 不得将未经该别名证明的 ID 变化静默覆盖到已注册身份。封禁和子域名接管的永久 fencing 优先于恢复。
 
-历史孤立域名没有可验证公钥时不自动推断归属。管理员调用 `POST /v1/admin/client-identities/recover`，请求包含 `originalInstallationId`、`replacementInstallationId`、`publicKey`、`subdomain`、`expectedHostRevision`、独立核验的备份 `evidence`，`apply` 默认 false 仅预检。应用要求不存在原运行记录，临时新身份没有域名、Share、租约或挂售引用，公钥及已验证 Owner 有效且没有 fencing；恢复、身份别名和管理员审计同事务提交。请求不得携带私钥。普通 Owner 下架不需要该管理员入口。
+历史孤立域名没有可验证公钥时不自动推断归属。管理员调用 `POST /v1/admin/client-identities/recover`，请求包含 `originalInstallationId`、`replacementInstallationId`、`publicKey`、`subdomain`、`expectedHostRevision`、独立核验的备份 `evidence`，`apply` 默认 false 仅预检。预检和应用共用完整校验，预检返回 `planHash`、原/临时 ID、域名修订和 `retiredRuntimeReferences`；应用必须同时传 `apply=true` 与该哈希 `expectedPlanHash`。缺少或失效的哈希返回 409 `CLIENT_IDENTITY_RECOVERY_PREVIEW_REQUIRED`。域名、已验证 Owner、控制凭据、稳定运行元数据或引用变化要求重新预检；心跳时间和地域观测推进不单独使预检失效。
+
+应用要求不存在原运行记录，临时新身份没有域名、Share、租约或挂售引用，公钥及已验证 Owner 有效且没有 fencing。外键引用仅允许明确可重建的通知/能力/价目交付运行记录级联退休，其余引用阻止应用。事务先快照运行记录的全部列，删除临时运行记录，再用原 ID 恢复该快照，避免违反公钥唯一索引；控制凭据和可选元数据保留。原/临时身份已知的最大离线通知序号一并保留，创建未启用监控的新通知基线，防止旧事件去重键复用或误恢复过期在线状态。持久身份锚点、历史别名和管理员审计同事务提交，任何一步失败全部回滚。相同公钥和 ID 对的已应用别名返回 `alreadyApplied=true`，不重复审计。请求不得携带私钥。普通 Owner 下架不需要该管理员入口。证据准备工具与实例恢复步骤见 [身份恢复文档](docs/client-identity-recovery-and-offline-unlisting.md)。
 
 注册成功只建立 installation 控制身份,不会立即形成可见 Client。Server 还必须完成 owner 验证、启用同 owner 的 Client tunnel,并签名上报 setup 完成;Router 随后写入 `client_activated_at`。Dashboard、Metrics、Client 日志入口、Client chat、公开地图和 Share 清单只读取已经激活的 Client。在线状态只由 `/v1/installations/heartbeat` 更新,其他签名控制请求只更新一般活动时间。
 

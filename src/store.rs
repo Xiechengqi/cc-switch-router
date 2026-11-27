@@ -44775,6 +44775,7 @@ pub(crate) mod tests {
         {
             let c = store.conn.lock().await;
             c.execute("UPDATE installations SET owner_email='owner@example.com',owner_verified_at=?2 WHERE id=?1",params![replacement.installation_id,Utc::now().to_rfc3339()]).unwrap();
+            c.execute("INSERT INTO client_notification_events(id,dedupe_key,kind,installation_id,episode,status,occurred_at,not_before,snapshot_json,created_at,updated_at) VALUES('historic-recovery-offline','historic-recovery-offline','client_offline',?1,9,'pending',?2,?2,'{}',?2,?2)",params![original,Utc::now().to_rfc3339()]).unwrap();
         }
         let request = |apply, public_key| ClientIdentityRecoveryRequest {
             original_installation_id: original.clone(),
@@ -44784,12 +44785,82 @@ pub(crate) mod tests {
             expected_host_revision: revision,
             evidence: "verified offline backup sha256 evidence".into(),
             apply,
+            expected_plan_hash: None,
         };
+        {
+            let c = store.conn.lock().await;
+            let unique: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='idx_installations_public_key_unique' AND sql LIKE 'CREATE UNIQUE INDEX%'", [], |r|r.get(0)).unwrap();
+            assert_eq!(
+                unique, 1,
+                "the repair must work with the production public-key unique index"
+            );
+            c.execute("UPDATE installations SET app_commit_id='recovery-preserved-commit',delegate_upgrade_to_router_owner=0 WHERE id=?1",params![replacement.installation_id]).unwrap();
+        }
         let preview = store
             .recover_client_identity("admin@example.com", request(false, public_key_b64(&key)))
             .await
             .unwrap();
         assert_eq!(preview["applied"], false);
+        assert_eq!(preview["offlineEpisode"], 9);
+        {
+            let c = store.conn.lock().await;
+            c.execute(
+                "UPDATE installations SET last_seen_at=?2,public_ip='192.0.2.9' WHERE id=?1",
+                params![replacement.installation_id, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let heartbeat_preview = store
+            .recover_client_identity("admin@example.com", request(false, public_key_b64(&key)))
+            .await
+            .unwrap();
+        assert_eq!(preview["planHash"], heartbeat_preview["planHash"]);
+        {
+            let c = store.conn.lock().await;
+            c.execute(
+                "UPDATE installations SET delegate_upgrade_to_router_owner=1 WHERE id=?1",
+                params![replacement.installation_id],
+            )
+            .unwrap();
+        }
+        let mut changed = request(true, public_key_b64(&key));
+        changed.expected_plan_hash = preview["planHash"].as_str().map(str::to_string);
+        assert_eq!(
+            store
+                .recover_client_identity("admin@example.com", changed)
+                .await
+                .unwrap_err()
+                .code(),
+            Some("CLIENT_IDENTITY_RECOVERY_PREVIEW_REQUIRED")
+        );
+        {
+            let c = store.conn.lock().await;
+            c.execute(
+                "UPDATE installations SET delegate_upgrade_to_router_owner=0 WHERE id=?1",
+                params![replacement.installation_id],
+            )
+            .unwrap();
+            c.execute_batch("CREATE TABLE identity_recovery_test_cascade_ref (installation_id TEXT REFERENCES installations(id) ON DELETE CASCADE)").unwrap();
+            c.execute(
+                "INSERT INTO identity_recovery_test_cascade_ref(installation_id) VALUES(?1)",
+                params![replacement.installation_id],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .recover_client_identity("admin@example.com", request(false, public_key_b64(&key)))
+                .await
+                .unwrap_err()
+                .code(),
+            Some("CLIENT_IDENTITY_RECOVERY_REFERENCES")
+        );
+        store
+            .conn
+            .lock()
+            .await
+            .execute_batch("DROP TABLE identity_recovery_test_cascade_ref")
+            .unwrap();
         assert!(
             get_installation(&*store.conn.lock().await, &replacement.installation_id)
                 .unwrap()
@@ -44802,8 +44873,76 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+        assert_eq!(
+            store
+                .recover_client_identity("admin@example.com", request(true, public_key_b64(&key)))
+                .await
+                .unwrap_err()
+                .code(),
+            Some("CLIENT_IDENTITY_RECOVERY_PREVIEW_REQUIRED")
+        );
+        let mut stale = request(true, public_key_b64(&key));
+        stale.expected_plan_hash = Some("stale-preview".into());
+        assert_eq!(
+            store
+                .recover_client_identity("admin@example.com", stale)
+                .await
+                .unwrap_err()
+                .code(),
+            Some("CLIENT_IDENTITY_RECOVERY_PREVIEW_REQUIRED")
+        );
+        {
+            let c = store.conn.lock().await;
+            c.execute("INSERT INTO online_client_preflight(challenge,installation_id,expires_at) VALUES('recovery-fk-test',?1,9999999999)",params![replacement.installation_id]).unwrap();
+        }
+        assert_eq!(
+            store
+                .recover_client_identity("admin@example.com", request(false, public_key_b64(&key)))
+                .await
+                .unwrap_err()
+                .code(),
+            Some("CLIENT_IDENTITY_RECOVERY_REFERENCES")
+        );
+        {
+            let c = store.conn.lock().await;
+            c.execute(
+                "DELETE FROM online_client_preflight WHERE challenge='recovery-fk-test'",
+                [],
+            )
+            .unwrap();
+            c.execute_batch("CREATE TEMP TRIGGER fail_recovery_audit BEFORE INSERT ON admin_audit_log WHEN NEW.action='client_identity.recover' BEGIN SELECT RAISE(ABORT,'injected recovery audit failure'); END;").unwrap();
+        }
+        let mut rollback_request = request(true, public_key_b64(&key));
+        rollback_request.expected_plan_hash = preview["planHash"].as_str().map(str::to_string);
+        assert!(
+            store
+                .recover_client_identity("admin@example.com", rollback_request)
+                .await
+                .is_err()
+        );
+        {
+            let c = store.conn.lock().await;
+            assert!(get_installation(&c, &original).unwrap().is_none());
+            assert!(
+                get_installation(&c, &replacement.installation_id)
+                    .unwrap()
+                    .is_some()
+            );
+            let anchor: String = c
+                .query_row(
+                    "SELECT installation_id FROM client_identities WHERE public_key=?1",
+                    params![public_key_b64(&key)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(anchor, replacement.installation_id);
+            c.execute_batch("DROP TRIGGER fail_recovery_audit;")
+                .unwrap();
+        }
+        let mut apply_request = request(true, public_key_b64(&key));
+        apply_request.expected_plan_hash = preview["planHash"].as_str().map(str::to_string);
         let applied = store
-            .recover_client_identity("admin@example.com", request(true, public_key_b64(&key)))
+            .recover_client_identity("admin@example.com", apply_request)
             .await
             .unwrap();
         assert_eq!(applied["applied"], true);
@@ -44814,6 +44953,21 @@ pub(crate) mod tests {
             vec![replacement.installation_id.clone()]
         );
         assert_eq!(restored.control_secret, replacement.control_secret);
+        {
+            let c = store.conn.lock().await;
+            let metadata:(String,bool)=c.query_row("SELECT app_commit_id,delegate_upgrade_to_router_owner FROM installations WHERE id=?1",params![original],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(metadata, ("recovery-preserved-commit".into(), false));
+            let epoch: i64 = c.query_row("SELECT offline_episode FROM installation_notification_state WHERE installation_id=?1",params![original],|row|row.get(0)).unwrap();
+            assert_eq!(epoch, 9);
+            let mut check = c.prepare("PRAGMA foreign_key_check").unwrap();
+            assert!(
+                check
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
         assert_eq!(
             store
                 .recover_client_identity("admin@example.com", request(true, public_key_b64(&key)))

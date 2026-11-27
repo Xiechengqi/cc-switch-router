@@ -43,10 +43,74 @@ Owner 在租和历史详情通过卖家专属 GET listing 状态读取独立的�
 - 原通知事件序号跨 GC 保留，避免恢复后去重键重用。健康数据使用独立 retention。
 - 新增回归用例仅编译，没有执行运行类或 UI 测试。最终静态验证结果在任务完成报告中记录。
 
-## 2026-11-27 静态验收与整体 review 结果
+## 2026-11-27 首次静态验收与整体 review 记录
 
 整体源码 review 已完成，当前范围内未发现未处理的阻塞项。复查修复了通知序号跨 GC、身份改变后旧 tunnel spec、已下架在租详情、归还命令与下架意图优先级、撤权独立于隧道恢复、网络校验失败退避，以及 marketListed 与租约保护混用的问题。Owner 专属状态接口在运行记录被回收后仍可查询同步意图；未确认本机同步不再被表述为市场下架未完成。
 
 静态结果：Router / Server 的 `cargo check --all-targets` 通过；Router 全目标 Clippy 通过但仍有仓库既有 lint 警告，Server 全目标 Clippy `-D warnings` 通过；Router 前端 TypeScript 无输出通过；两仓全部 Rust 源文件格式检查及 diff 空白检查通过；Server Provider Phase 0 证据生成/检查与文档索引审计通过。新增后端回归用例随全目标编译通过，未执行。
 
 未执行：服务启动、网络联测、迁移执行测试、运行类回归、UI/浏览器测试、部署、远程重启及生产身份修复。未将这些项目标记为通过。生产 violet 状态和 r0pu9iwq81 数据没有被本次工作修改，须在后续获准部署/数据处理后使用新行为与预检工具。
+
+## 2026-11-27 历史恢复补充修复
+
+随后只读核验发现：132 迁移执行前原运行身份已经丢失，迁移只能登记临时新身份；不能从仅含 ID 的域名目录反推出原公钥。同时恢复入口存在实现 bug：先插入原 ID、再删除临时 ID，会违反生产数据库 `idx_installations_public_key_unique`。旧预检只校验条件，没有覆盖实际写入顺序，因此预检成功不能证明应用可完成。
+
+本次改为共享预检/应用计划，并在一个事务内先删除临时运行记录，再完整重建原运行记录。保留原始 SQL 类型及所有列，包括控制凭据、版本、升级授权和可选元数据；保持唯一索引和外键约束开启。审计写入失败同样回滚身份删除与重建。原域名目录不改主；Provider、Account、Share 本地存储和加密根密钥均不写入。
+
+预检返回 `planHash` 与将退休的外键运行记录。应用携带 `expectedPlanHash`，复核域名修订、Owner、公钥、稳定运行属性、控制凭据和引用；引用不安全或计划改变即拒绝。业务恢复/清理表即使声明 `ON DELETE CASCADE` 也不自动允许删除。活跃心跳和地域采样不使计划持续失效。现存别名使同一恢复请求幂等。
+
+恢复同时取原/临时身份的已知最大离线通知序号，重建未启用监控、在线状态未知的通知基线，避免序号退回零后复用历史去重键。该序号纳入预检哈希；不会把旧离线事件或残留心跳当作当前在线证据。
+
+回归用例覆盖真实唯一索引、必需预检/过期预检、心跳不使预检失效而升级授权变更使其失效、阻塞外键/未知级联引用、可选列和控制凭据保留、离线通知序号延续、故障注入审计回滚、外键一致性以及重复应用。CI 明确选择这些测试并拒绝空过滤；本地仅编译，不执行。
+
+## sgptokenswitch 的具体恢复记录与操作材料
+
+本节是已核验证据与待执行步骤，**没有执行生产应用、部署或服务启动**。现场状态可能变化，应用前必须重新预检。
+
+| 项目 | 已核验值 |
+| --- | --- |
+| 原 Client ID | `d5920f1b-c59f-4dc4-bc2c-f432037edc16` |
+| 临时 Client ID | `f08cb9e8-b1e8-447c-9e0d-aff0f19da839` |
+| 保留域名 / 修订 | `r0pu9iwq81` / `1` |
+| 已验证 Owner | `router@sgptokenswitch.cc` |
+| 当前公钥 SHA256 前缀 | `d7d77ff544e49234`；实际核验使用完整公钥 |
+| 临时身份创建 | `2026-11-27 02:33:50 UTC` |
+| 132 迁移应用 | `2026-11-27 06:28:39 UTC`，晚于原身份丢失 |
+| 只读检查时安装版本 | Router `3708a27`；Server `f1e3e0dbb77f` |
+
+两份旧备份均将原 ID、域名和已验证 Owner 绑定到当前完整公钥。Router 运行及持久身份当前只存在临时 ID，原域名仍属于原 ID。没有这两个 ID 的 fencing、租约、挂售、Share 或待履行业务引用。Server 在检查时未运行，不需要为准备请求而启动。发现 21 个旧 Share 域名墓碑，其中仅 14 个在旧备份中仍有效且与当前本地启用 Share 对应；后续只由本地有效 Share 正常恢复，不能批量复活历史删除项。
+
+`scripts/ops/prepare-client-identity-recovery.py` 使用 Python 标准库：以只读连接核验 Router 数据库与备份 SHA256，读取 Server 配置中的公钥、ID、Owner 和域名，生成仅含公开恢复字段的请求。不读取 Server SQLite，不输出私钥、controlSecret 或供应商账号，不调用恢复 API。`--output` 仅创建新的 0600 请求文件，不覆盖已有文件。
+
+以下命令作为现场材料保存，当前未执行。备份/数据库路径属于远程 sgptokenswitch；脚本应由后续允许的交付流程提供，修正后的 Router 恢复 API 可用前不得应用。
+
+```bash
+python3 scripts/ops/prepare-client-identity-recovery.py \
+  --router-db /root/.cc-switch-router/cc-switch-router.db \
+  --server-config /root/.cc-switch-server/server.json \
+  --original-id d5920f1b-c59f-4dc4-bc2c-f432037edc16 \
+  --replacement-id f08cb9e8-b1e8-447c-9e0d-aff0f19da839 \
+  --subdomain r0pu9iwq81 --expected-host-revision 1 \
+  --trusted-backup /root/.cc-switch-router/deployments/host-health-20261123-final/before.sqlite \
+    990769b7149b497335d8b4579bf7ec7b44fb41c307aba789665a1a695b75bb7d \
+  --trusted-backup /root/.cc-switch-router/deployments/host-health-20261123-pAvcs/before.sqlite \
+    0e6d5bd22bbec34ce8ca7d6a0dfc5ce7d730d31bdd67bb6654d9cf6396edffaf \
+  --output recovery-request.json
+```
+
+1. 应用前用受支持的 SQLite 在线备份方式备份当前 Router DB，保持 Server 现有配置、数据和根密钥；不能用旧 Router 备份覆盖整个生产库。较旧的远程 Python SQLite 3.37.2 不能解析 Server 数据库中的新 JSON 运算符，这不是数据损坏证据，不能因此清空 Server 数据。
+2. 使用已有 Router 管理员会话提交 `recovery-request.json`，调用 `POST /v1/admin/client-identities/recover`，保持 `apply=false`。核对原/临时 ID、域名修订、Owner、`planHash` 和引用列表。准备工具不替代 API 的 fencing/业务义务/外键检查。
+3. 预检无冲突后，由同一请求追加 `apply=true` 与 `expectedPlanHash=<预检返回值>` 调用同一接口；如果状态变化，重新预检，禁止跳过约束或直接改主键。成功应只有一个原身份运行记录、一个原身份锚点、一条临时 ID → 原 ID 别名和一条恢复审计；域名仍属于原 ID。
+4. 后续允许 Server 运行或显式重连时，注册返回原 ID 及含临时 ID 的 `previousInstallationIds`；Server 原子保存身份并依次恢复 Client 控制隧道、有效 Share 描述和 Share 隧道，最后发送健康刷新。原子域名和供应商账号数据继续使用，不执行 init，不清空目录。
+5. 后续动态验收确认 Router 心跳在线、子域名可达、14 个有效 Share 的实际状态，以及本地账号数量与身份未变。未完成这些检查前，不报告生产恢复成功。
+
+Server 同步修复：本地初始化标记不随 Router claim 失败回退；本地登录保持可用且匿名初始化入口关闭，在租 Owner 仍被禁止管理。诊断区分注册、连接、域名冲突和身份恢复，并保留无 URL 时的具体错误。模型健康刷新先排队，依赖有效 Client/Share actor 和描述 ACK，失败或并发更新保留队列，进程重启按有效本地 Share 重建待刷新项。
+
+## 本轮整体 review 与静态验证记录
+
+已复核恢复事务的唯一键/外键顺序、完整运行列和控制凭据保留、预检失效条件、fencing/接管/业务引用保护、通知序号和审计失败回滚，以及 Server 初始化、在租隔离、当前完整 tunnel spec 和健康通知排队边界。本次范围内未留下已知阻塞问题；生产应用和动态正确性仍待后续验收。
+
+- Router、Server 的 `cargo check --locked --all-targets` 通过，回归用例仅编译。最终 Router 全目标 Clippy 通过（仓库既有警告仍存在）；Server 全目标 Clippy `-D warnings` 通过。
+- Server Web TypeScript、Provider Phase 0 生成/检查、Provider coverage、UI Provider matrix、Web runtime/产品边界/i18n 及文档索引审计通过；Router Share 模型健康契约审计通过。
+- 本次修改文件的 Rust 格式及两仓 diff 空白检查通过。Server 全部 Rust 格式检查通过；Router 全仓格式检查在本次范围外的 `src/online_client_seller_summary.rs`、`src/schema.rs`、`src/share_market_audit/tests.rs` 报告既有格式差异，未改动这些文件。
+- 恢复准备脚本仅作 AST 语法检查；新增 CI 过滤器通过源码核对，均匹配实际测试声明。未运行准备工具、运行类测试、UI 测试、服务、部署或生产恢复 API。

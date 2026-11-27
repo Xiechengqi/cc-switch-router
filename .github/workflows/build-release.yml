@@ -196,6 +196,11 @@ jobs:
           bash scripts/ci/timed.sh 'Browser cookie isolation' bash scripts/ci/require-tests.sh cargo test --locked browser_cookie_
           bash scripts/ci/timed.sh 'Browser credential lifecycle' bash scripts/ci/require-tests.sh cargo test --locked browser_credentials_
 
+      - name: Test durable Client identity and historical recovery
+        run: |
+          bash scripts/ci/timed.sh 'Durable Client identity' bash scripts/ci/require-tests.sh cargo test --locked same_key_restores_original_identity_domain_and_notification_epoch
+          bash scripts/ci/timed.sh 'Historical identity recovery' bash scripts/ci/require-tests.sh cargo test --locked historical_identity_repair_
+
       - name: Test real migrations without template shortcuts
         run: bash scripts/ci/timed.sh 'Real schema migrations' cargo test --locked schema::tests
 
