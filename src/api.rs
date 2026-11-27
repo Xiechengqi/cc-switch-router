@@ -1919,7 +1919,9 @@ async fn recover_client_identity(
         .store
         .recover_client_identity(&actor.email, input)
         .await?;
-    state.dashboard_cache.invalidate();
+    if result["applied"] == true && result["alreadyApplied"] != true {
+        state.dashboard_cache.invalidate();
+    }
     Ok(Json(result))
 }
 

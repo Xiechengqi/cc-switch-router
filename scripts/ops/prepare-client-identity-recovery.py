@@ -22,11 +22,11 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def read_database(path):
-    connection = sqlite3.connect(
-        "file:" + quote(str(Path(path).resolve()), safe="/") + "?mode=ro",
-        uri=True,
-    )
+def read_database(path, *, immutable=False):
+    uri = "file:" + quote(str(Path(path).resolve()), safe="/") + "?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
     connection.execute("BEGIN")
@@ -65,7 +65,9 @@ def prepare(args):
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
         require(digest.hexdigest() == expected_hash, "trusted backup SHA256 changed")
-        backup = read_database(path)
+        # Only the standalone backup file is covered by its supplied SHA256.
+        # A separate WAL beside it cannot serve as identity evidence.
+        backup = read_database(path, immutable=True)
         try:
             verified_installation(backup, args.original_id, public_key, email)
             tunnel = backup.execute(
@@ -84,8 +86,12 @@ def prepare(args):
         anchor = live.execute("SELECT installation_id,lifecycle,owner_email,owner_verified_at FROM client_identities WHERE public_key=?", (public_key,)).fetchone()
         require(anchor and anchor["installation_id"] == args.replacement_id and anchor["lifecycle"] == "active"
                 and anchor["owner_email"] == email and anchor["owner_verified_at"], "durable replacement identity changed")
-        host = live.execute("SELECT kind,subject_id,installation_id,lifecycle,revision FROM public_hosts WHERE label=?", (args.subdomain,)).fetchone()
+        host = live.execute(
+            "SELECT kind,subject_id,installation_id,route_id,target_lane_id,lifecycle,revision "
+            "FROM public_hosts WHERE label=?", (args.subdomain,),
+        ).fetchone()
         require(host and host["kind"] == "client" and host["subject_id"] == args.original_id
+                and host["route_id"] == "client:" + args.original_id and host["target_lane_id"] == args.original_id
                 and host["installation_id"] == args.original_id and host["lifecycle"] != "tombstoned"
                 and host["revision"] == args.expected_host_revision, "reserved Client host changed")
     finally:
@@ -98,6 +104,7 @@ def prepare(args):
         "publicKey": public_key,
         "subdomain": args.subdomain,
         "expectedHostRevision": args.expected_host_revision,
+        "expectedOwnerEmail": email,
         "evidence": evidence,
         "apply": False,
     }

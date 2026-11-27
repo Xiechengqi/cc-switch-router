@@ -30693,6 +30693,7 @@ fn gateway_share_label(share_id: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    mod identity_recovery;
     mod model_health_status;
     mod share_account_identity;
     mod share_market_control;
@@ -44702,11 +44703,39 @@ pub(crate) mod tests {
         let (store, config) = setup_store("identity-restores-domain").await;
         let key = insert_signed_installation(&store, "durable-client").await;
         claim_setup_client_tunnel(&store, &config, &key, "durable-client", "durable-host").await;
+        store
+            .complete_installation_setup(signed_setup_completed_request(
+                &key,
+                "durable-client",
+                setup_completed_payload(&Uuid::new_v4().to_string(), "p******w"),
+                Utc::now().timestamp_millis(),
+                &Uuid::new_v4().to_string(),
+            ))
+            .await
+            .unwrap();
         {
             let c = store.conn.lock().await;
             insert_installation_notification_baseline(&c, "durable-client", Utc::now()).unwrap();
-            c.execute("UPDATE installation_notification_state SET offline_episode=7 WHERE installation_id='durable-client'",[]).unwrap();
-            purge_installation_data_tx(&c, "durable-client").unwrap();
+            c.execute(
+                "UPDATE installation_notification_state SET offline_episode=7 WHERE installation_id='durable-client'",
+                [],
+            )
+            .unwrap();
+        }
+        let proxy = ProxyRegistry::default();
+        assert_eq!(config.client_installation_retention_secs, 6 * 60 * 60);
+        for (hours_offline, expected_removals) in [(5, 0), (7, 1)] {
+            mark_installation_last_seen(
+                &store,
+                "durable-client",
+                Utc::now() - Duration::hours(hours_offline),
+            )
+            .await;
+            let cleanup = store.cleanup_expired_data(&config, &proxy).await.unwrap();
+            assert_eq!(cleanup.deleted_installations, expected_removals);
+        }
+        {
+            let c = store.conn.lock().await;
             assert!(get_installation(&c, "durable-client").unwrap().is_none());
             assert_eq!(
                 crate::public_hosts::get_by_label(&c, "durable-host")
@@ -44783,6 +44812,7 @@ pub(crate) mod tests {
             public_key,
             subdomain: "legacy-recover".into(),
             expected_host_revision: revision,
+            expected_owner_email: None,
             evidence: "verified offline backup sha256 evidence".into(),
             apply,
             expected_plan_hash: None,

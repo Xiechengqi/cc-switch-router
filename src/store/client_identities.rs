@@ -1,6 +1,9 @@
 //! Durable Client identity and explicit, audited repair of pre-registry orphans.
 use super::*;
 
+mod recovery_records;
+use recovery_records::RecoveryRecords;
+
 pub(super) struct RememberedIdentity {
     pub id: String,
     pub owner_email: Option<String>,
@@ -53,6 +56,8 @@ pub struct ClientIdentityRecoveryRequest {
     pub public_key: String,
     pub subdomain: String,
     pub expected_host_revision: i64,
+    /// Owner independently verified against the original backup by the preparation tool.
+    pub expected_owner_email: Option<String>,
     /// Description/hash of independently verified operator evidence; never a private key.
     pub evidence: String,
     #[serde(default)]
@@ -64,6 +69,7 @@ pub struct ClientIdentityRecoveryRequest {
 /// Snapshot every runtime column before deleting the replacement. Keeping
 /// opaque SQL values avoids losing optional metadata or exposing control keys.
 struct RecoveryPlan {
+    records: RecoveryRecords,
     columns: Vec<String>,
     values: Vec<crate::db::types::Value>,
     hash: String,
@@ -76,70 +82,92 @@ fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn recovery_conflict(reason: &'static str, message: &str, details: serde_json::Value) -> AppError {
-    AppError::coded_conflict(reason, message, details)
+fn recovery_db(error: crate::db::Error) -> AppError {
+    AppError::Internal(format!("inspect or restore Client recovery data: {error}"))
 }
 
-fn referencing_rows(conn: &Connection, id: &str) -> Result<Vec<serde_json::Value>, AppError> {
-    let tables = {
-        let mut statement = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%installations%' AND name!='installations'")
-            .map_err(|e| AppError::Internal(format!("inspect recovery references: {e}")))?;
-        collect_rows(
-            statement
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| AppError::Internal(e.to_string()))?,
-        )?
-    };
-    let mut references = Vec::new();
-    for table in tables {
-        let foreign_keys = {
-            let mut statement = conn
-                .prepare(&format!("PRAGMA foreign_key_list({})", quoted(&table)))
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            collect_rows(
-                statement
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, Option<String>>(4)?
-                                .unwrap_or_else(|| "id".into()),
-                            r.get::<_, String>(6)?,
-                        ))
-                    })
-                    .map_err(|e| AppError::Internal(e.to_string()))?,
-            )?
-        };
-        for (parent, column, parent_column, on_delete) in foreign_keys {
-            if !parent.eq_ignore_ascii_case("installations") {
-                continue;
-            }
-            let count: i64 = conn
-                .query_row(
-                    &format!(
-                        "SELECT count(*) FROM {} AS child JOIN installations AS parent ON child.{}=parent.{} WHERE parent.id=?1",
-                        quoted(&table),
-                        quoted(&column),
-                        quoted(&parent_column),
-                    ),
-                    params![id],
-                    |r| r.get(0),
-                )
-                .map_err(|e| {
-                    AppError::Internal(format!("inspect {table} recovery references: {e}"))
-                })?;
-            if count > 0 {
-                references.push(serde_json::json!({"table":table,"column":column,"parentColumn":parent_column,"onDelete":on_delete,"count":count}));
-            }
-        }
-    }
-    references.sort_by_key(|item| {
-        (
-            item["table"].as_str().unwrap_or_default().to_string(),
-            item["column"].as_str().unwrap_or_default().to_string(),
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", quoted(table)))
+        .map_err(recovery_db)?;
+    collect_rows(stmt.query_map([], |row| row.get(1)).map_err(recovery_db)?)
+}
+
+fn insert_snapshot(
+    conn: &Connection,
+    table: &str,
+    columns: &[String],
+    values: Vec<crate::db::types::Value>,
+) -> Result<(), AppError> {
+    let names = columns
+        .iter()
+        .map(|column| quoted(column))
+        .collect::<Vec<_>>()
+        .join(",");
+    let slots = vec!["?"; columns.len()].join(",");
+    let changed = conn
+        .execute(
+            &format!("INSERT INTO {} ({names}) VALUES ({slots})", quoted(table)),
+            params_from_iter(values),
         )
-    });
-    Ok(references)
+        .map_err(recovery_db)?;
+    if changed != 1 {
+        return Err(AppError::Internal(format!(
+            "could not restore one {table} record"
+        )));
+    }
+    Ok(())
+}
+
+// Aliases and their audit receipts are written in the same transaction, including
+// by previous Router versions. Replay the committed receipt after a lost response.
+fn applied_recovery(
+    conn: &Connection,
+    input: &ClientIdentityRecoveryRequest,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let receipt = conn.query_row(
+        "SELECT (SELECT l.payload_json FROM admin_audit_log l
+            WHERE l.action='client_identity.recover' AND l.created_at=a.created_at
+              AND json_extract(l.payload_json,'$.installationId')=a.installation_id
+              AND json_extract(l.payload_json,'$.replacementInstallationId')=a.previous_installation_id)
+         FROM client_identity_aliases a WHERE a.previous_installation_id=?1 AND a.installation_id=?2 AND a.public_key=?3",
+        params![input.replacement_installation_id,input.original_installation_id,input.public_key],
+        |row| row.get::<_, Option<String>>(0)
+    ).optional().map_err(recovery_db)?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    let raw = receipt.ok_or_else(|| {
+        AppError::Internal("committed Client recovery is missing its audit receipt".into())
+    })?;
+    let mut result: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| AppError::Internal(format!("read Client recovery receipt: {e}")))?;
+    if result["subdomain"] != input.subdomain
+        || result["hostRevision"] != input.expected_host_revision
+    {
+        return Err(recovery_conflict(
+            "CLIENT_IDENTITY_RECOVERY_HOST_CHANGED",
+            "the previous recovery used a different reserved host or revision",
+            serde_json::json!({}),
+        ));
+    }
+    if input
+        .expected_owner_email
+        .as_ref()
+        .is_some_and(|owner| result["ownerEmail"].as_str() != Some(owner.as_str()))
+    {
+        return Err(recovery_conflict(
+            "CLIENT_IDENTITY_RECOVERY_ANCHOR_CHANGED",
+            "the committed recovery used a different verified owner",
+            serde_json::json!({}),
+        ));
+    }
+    result["alreadyApplied"] = true.into();
+    Ok(Some(result))
+}
+
+fn recovery_conflict(reason: &'static str, message: &str, details: serde_json::Value) -> AppError {
+    AppError::coded_conflict(reason, message, details)
 }
 
 fn prepare_recovery(
@@ -152,6 +180,8 @@ fn prepare_recovery(
         .map_err(map_public_host_error)?
         .ok_or_else(|| AppError::NotFound("reserved Client host not found".into()))?;
     if host.kind != PublicHostKind::Client
+        || host.route_id != format!("client:{original}")
+        || host.target_lane_id != *original
         || host.subject_id != *original
         || host.installation_id.as_deref() != Some(original.as_str())
         || host.revision != input.expected_host_revision
@@ -184,6 +214,10 @@ fn prepare_recovery(
         || !active
         || runtime.owner_verified_at.is_none()
         || runtime.owner_email.as_deref().is_none_or(str::is_empty)
+        || input
+            .expected_owner_email
+            .as_ref()
+            .is_some_and(|owner| runtime.owner_email.as_ref() != Some(owner))
         || identity.as_ref().is_none_or(|anchor| {
             anchor.id != *replacement
                 || anchor.fenced
@@ -197,61 +231,7 @@ fn prepare_recovery(
             serde_json::json!({}),
         ));
     }
-    // Migration 127 physically removed SSH provisioning. Check obligations in
-    // the current Online Client schema; retired tables must not be queried.
-    let blocked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM installation_fences WHERE public_key=?3 OR installation_id IN (?1,?2))
-        OR EXISTS(SELECT 1 FROM client_identities WHERE installation_id=?1)
-        OR EXISTS(SELECT 1 FROM client_identity_aliases WHERE previous_installation_id IN (?1,?2) OR installation_id IN (?1,?2))
-        OR EXISTS(SELECT 1 FROM client_subdomain_takeovers WHERE target_installation_id IN (?1,?2) OR source_installation_id IN (?1,?2))
-        OR EXISTS(SELECT 1 FROM public_hosts WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM installation_client_tunnels WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM shares WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id IN (?1,?2))
-        OR EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id IN (?1,?2) AND released_at IS NULL)
-        OR EXISTS(SELECT 1 FROM client_market_terminations WHERE host_id IN (?1,?2) AND (status='finance_pending' OR cleanup_confirmed_at IS NULL))
-        OR EXISTS(SELECT 1 FROM online_client_operations WHERE installation_id IN (?1,?2))
-        OR EXISTS(SELECT 1 FROM installation_upgrade_tasks WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM share_value_owner_model_prices WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM share_market_listings WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM share_request_logs WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM image_generation_jobs WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM image_generation_request_logs WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM share_edit_requests WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM leases WHERE installation_id IN (?1,?2))", params![original,replacement,input.public_key], |r| r.get(0))
-        .map_err(|e| AppError::Internal(format!("check recovery obligations: {e}")))?;
-    if blocked {
-        return Err(recovery_conflict(
-            "CLIENT_IDENTITY_RECOVERY_OBLIGATIONS",
-            "identity recovery is blocked by fencing, claims or business references",
-            serde_json::json!({}),
-        ));
-    }
-    let references = referencing_rows(conn, replacement)?;
-    let blocking = references
-        .iter()
-        .filter(|item| {
-            item["onDelete"].as_str() != Some("CASCADE")
-                || !matches!(
-                    item["table"].as_str(),
-                    Some(
-                        "installation_notification_state"
-                            | "installation_setup_completions"
-                            | "installation_value_capabilities"
-                            | "share_value_pricing_activations"
-                            | "share_value_pricing_installation_tariffs"
-                            | "share_value_pricing_installation_revisions"
-                    )
-                )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !blocking.is_empty() {
-        return Err(recovery_conflict(
-            "CLIENT_IDENTITY_RECOVERY_REFERENCES",
-            "replacement has references that cannot be safely retired",
-            serde_json::json!({"references":blocking}),
-        ));
-    }
+    let records = RecoveryRecords::inspect(conn, input)?;
     let offline_episode: i64 = conn.query_row(
         "SELECT max(0,
             COALESCE((SELECT offline_episode FROM client_identities WHERE installation_id=?2),0),
@@ -259,16 +239,7 @@ fn prepare_recovery(
             COALESCE((SELECT max(episode) FROM client_notification_events WHERE installation_id IN (?1,?2)),0))",
         params![original,replacement], |row| row.get(0))
         .map_err(|error| AppError::Internal(format!("read recovered notification epoch: {error}")))?;
-    let columns = {
-        let mut statement = conn
-            .prepare("PRAGMA table_info(installations)")
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        collect_rows(
-            statement
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(|e| AppError::Internal(e.to_string()))?,
-        )?
-    };
+    let columns = table_columns(conn, "installations")?;
     let mut values = conn
         .query_row(
             &format!(
@@ -332,12 +303,12 @@ fn prepare_recovery(
     let runtime_hash = hex::encode(runtime_digest.finalize());
     let hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&serde_json::json!({
-            "version":1,"original":original,"replacement":replacement,"publicKey":input.public_key,
+            "version":2,"original":original,"replacement":replacement,"publicKey":input.public_key,
             "subdomain":host.label,"revision":host.revision,"ownerEmail":runtime.owner_email,
             "ownerVerifiedAt":runtime.owner_verified_at,"runtimeHash":runtime_hash,"columns":columns,
             "hostLifecycle":host.lifecycle.as_str(),"hostCreatedAt":host.created_at,
             "offlineEpisode":offline_episode,
-            "references":references,"evidence":input.evidence,
+            "records":records.summary,"evidence":input.evidence,
         }))
         .map_err(|e| AppError::Internal(e.to_string()))?,
     ));
@@ -349,10 +320,15 @@ fn prepare_recovery(
             *value = crate::db::types::Value::Text(host.created_at.to_rfc3339());
         }
     }
-    let result = serde_json::json!({"ok":true,"applied":input.apply,"installationId":original,
+    let mut result = serde_json::json!({"ok":true,"applied":input.apply,"installationId":original,
         "replacementInstallationId":replacement,"subdomain":host.label,"hostRevision":host.revision,
-        "ownerEmail":runtime.owner_email,"planHash":hash,"retiredRuntimeReferences":references,"offlineEpisode":offline_episode});
+        "ownerEmail":runtime.owner_email,"planHash":hash,"offlineEpisode":offline_episode});
+    result
+        .as_object_mut()
+        .expect("recovery result is an object")
+        .extend(records.summary.clone());
     Ok(RecoveryPlan {
+        records,
         columns,
         values,
         hash,
@@ -368,7 +344,7 @@ impl AppStore {
     pub async fn recover_client_identity(
         &self,
         actor: &str,
-        input: ClientIdentityRecoveryRequest,
+        mut input: ClientIdentityRecoveryRequest,
     ) -> Result<serde_json::Value, AppError> {
         if input.evidence.trim().len() < 16
             || input.evidence.len() > 1024
@@ -380,15 +356,18 @@ impl AppStore {
             return Err(AppError::BadRequest("valid distinct IDs, public key and independently verified backup evidence are required".into()));
         }
         validate_ed25519_public_key(&input.public_key)?;
+        input.subdomain = input.subdomain.trim().to_ascii_lowercase();
         let conn = self.conn.lock().await;
+        let behavior = if input.apply {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        };
         let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(behavior)
             .map_err(|e| AppError::Internal(format!("begin identity recovery: {e}")))?;
-        let alias:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM client_identity_aliases WHERE previous_installation_id=?1 AND installation_id=?2 AND public_key=?3)",params![input.replacement_installation_id,input.original_installation_id,input.public_key],|r|r.get(0)).map_err(|e|AppError::Internal(e.to_string()))?;
-        if alias {
-            return Ok(
-                serde_json::json!({"ok":true,"applied":true,"alreadyApplied":true,"installationId":input.original_installation_id}),
-            );
+        if let Some(result) = applied_recovery(&tx, &input)? {
+            return Ok(result);
         }
         let plan = prepare_recovery(&tx, &input)?;
         if !input.apply {
@@ -406,22 +385,9 @@ impl AppStore {
         let now = Utc::now().to_rfc3339();
         // Retire the replacement BEFORE inserting the same public key under
         // the original ID. The public-key unique index remains in force.
-        purge_installation_data_tx(&tx, replacement)?;
-        let names = plan
-            .columns
-            .iter()
-            .map(|name| quoted(name))
-            .collect::<Vec<_>>()
-            .join(",");
-        let placeholders = (1..=plan.values.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        tx.execute(
-            &format!("INSERT INTO installations ({names}) VALUES ({placeholders})"),
-            params_from_iter(plan.values),
-        )
-        .map_err(|e| AppError::Internal(format!("restore original runtime: {e}")))?;
+        plan.records.retire_replacement(&tx, replacement)?;
+        insert_snapshot(&tx, "installations", &plan.columns, plan.values)?;
+        plan.records.restore_tasks(&tx)?;
         let moved=tx.execute("UPDATE client_identities SET installation_id=?1,created_at=?4,client_activated_at=?4,updated_at=?5,offline_episode=?6 WHERE installation_id=?2 AND public_key=?3 AND lifecycle='active'",params![original,replacement,input.public_key,plan.created_at,now,plan.offline_episode])
             .map_err(|e|AppError::Internal(format!("restore identity anchor: {e}")))?;
         if moved != 1 {
