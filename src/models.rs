@@ -217,6 +217,8 @@ pub struct RegisterInstallationResponse {
     /// client's Ed25519 keypair. Clients must persist it and verify inbound
     /// control calls against it.
     pub control_secret: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub previous_installation_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

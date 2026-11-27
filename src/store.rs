@@ -108,6 +108,8 @@ use crate::registration_admission::{
 };
 
 mod browser_sessions;
+mod client_identities;
+pub use client_identities::ClientIdentityRecoveryRequest;
 pub(crate) mod client_chat;
 pub(crate) mod client_web_sessions;
 pub(crate) mod model_health;
@@ -2402,9 +2404,22 @@ impl AppStore {
                     "installation identity is permanently fenced: {reason}"
                 )));
             }
+            let remembered = client_identities::remembered_identity(&tx, public_key)?;
+            if remembered.as_ref().is_some_and(|identity| identity.fenced) {
+                return Err(AppError::Forbidden(
+                    "installation identity is permanently fenced".into(),
+                ));
+            }
             let existing_installation_id = find_installation_id_by_public_key(&tx, public_key)?;
+            if let (Some(identity), Some(existing)) = (&remembered, &existing_installation_id)
+                && identity.id != *existing
+            {
+                return Err(AppError::Conflict(
+                    "client_identity_recovery_required: conflicting runtime identity".into(),
+                ));
+            }
             verify_registration_signature(public_key, &input, now)?;
-            if existing_installation_id.is_none() {
+            if existing_installation_id.is_none() && remembered.is_none() {
                 consume_new_identity_admission(&tx, &source_scope, admission_policy, now)?;
             }
             consume_identity_registration_nonce(
@@ -2443,21 +2458,31 @@ impl AppStore {
                         |row| row.get::<_, String>(0),
                     )
                     .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?;
+                let previous_installation_ids =
+                    client_identities::registration_aliases(&tx, &existing_installation_id)?;
                 tx.commit().map_err(|error| {
                     AppError::Internal(format!("commit installation registration failed: {error}"))
                 })?;
                 RegisterInstallationResponse {
                     installation_id: existing_installation_id,
                     control_secret,
+                    previous_installation_ids,
                 }
             } else {
                 let installation = Installation {
-                    id: Uuid::new_v4().to_string(),
+                    id: remembered
+                        .as_ref()
+                        .map(|identity| identity.id.clone())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
                     public_key: public_key.to_string(),
                     platform: platform.to_string(),
                     app_version: input.app_version,
-                    owner_email: None,
-                    owner_verified_at: None,
+                    owner_email: remembered
+                        .as_ref()
+                        .and_then(|identity| identity.owner_email.clone()),
+                    owner_verified_at: remembered
+                        .as_ref()
+                        .and_then(|identity| identity.owner_verified_at),
                     last_seen_ip: ip.clone(),
                     country_code,
                     country: None,
@@ -2474,9 +2499,13 @@ impl AppStore {
                     geo_candidate_hits: 0,
                     geo_candidate_first_seen_at: None,
                     geo_last_changed_at: None,
-                    created_at: now,
+                    created_at: remembered
+                        .as_ref()
+                        .map_or(now, |identity| identity.created_at),
                     last_seen_at: now,
-                    client_activated_at: None,
+                    client_activated_at: remembered
+                        .as_ref()
+                        .and_then(|identity| identity.activated_at),
                     delegate_upgrade_to_router_owner: None,
                     app_commit_id: None,
                     update_available: None,
@@ -2527,13 +2556,30 @@ impl AppStore {
             ],
                 )
                 .map_err(|e| AppError::Internal(format!("insert installation failed: {e}")))?;
+                if installation.client_activated_at.is_some() {
+                    tx.execute(
+                        "UPDATE installations SET client_activated_at=?2 WHERE id=?1",
+                        params![
+                            installation.id,
+                            installation.client_activated_at.map(|at| at.to_rfc3339())
+                        ],
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("restore Client activation failed: {e}"))
+                    })?;
+                }
                 insert_installation_notification_baseline(&tx, &installation.id, now)?;
+                tx.execute("UPDATE installation_notification_state SET offline_episode=max(offline_episode,COALESCE((SELECT offline_episode FROM client_identities WHERE installation_id=?1),0)) WHERE installation_id=?1",params![installation.id])
+                    .map_err(|e|AppError::Internal(format!("restore notification epoch: {e}")))?;
+                let previous_installation_ids =
+                    client_identities::registration_aliases(&tx, &installation.id)?;
                 tx.commit().map_err(|error| {
                     AppError::Internal(format!("commit installation registration failed: {error}"))
                 })?;
                 RegisterInstallationResponse {
                     installation_id: installation.id,
                     control_secret: new_control_secret,
+                    previous_installation_ids,
                 }
             }
         };
@@ -7504,10 +7550,18 @@ impl AppStore {
                 reason: Some("already_claimed".into()),
             });
         }
-        if crate::public_hosts::get_by_label(&conn, &subdomain)
-            .map_err(map_public_host_error)?
-            .is_some()
+        if let Some(host) =
+            crate::public_hosts::get_by_label(&conn, &subdomain).map_err(map_public_host_error)?
         {
+            if host.kind == PublicHostKind::Client
+                && host.lifecycle != crate::public_hosts::PublicHostLifecycle::Tombstoned
+                && installation_id.is_some_and(|id| id == host.subject_id)
+            {
+                return Ok(SubdomainAvailabilityResponse {
+                    available: true,
+                    reason: None,
+                });
+            }
             return Ok(SubdomainAvailabilityResponse {
                 available: false,
                 reason: Some("previously_claimed".into()),
@@ -12852,14 +12906,18 @@ impl AppStore {
                 list_client_tunnels(&conn)?,
                 {
                     let mut stmt = conn
-                        .prepare("SELECT i.id,i.market_lease_v1,COALESCE(l.state!='unlisted',0)
+                        .prepare("SELECT i.id,i.market_lease_v1,COALESCE(l.state!='unlisted',0),EXISTS(SELECT 1 FROM online_client_protection p WHERE p.installation_id=i.id)
                             FROM installations i LEFT JOIN online_client_listings l ON l.installation_id=i.id
-                            WHERE i.market_lease_v1=1 OR l.state!='unlisted'")
+                            WHERE i.market_lease_v1=1 OR EXISTS(SELECT 1 FROM online_client_protection p WHERE p.installation_id=i.id) OR l.unlist_pending=1")
                         .map_err(|e| AppError::Internal(e.to_string()))?;
                     stmt.query_map([], |r| {
                         Ok((
                             r.get::<_, String>(0)?,
-                            (r.get::<_, bool>(1)?, r.get::<_, bool>(2)?),
+                            (
+                                r.get::<_, bool>(1)?,
+                                r.get::<_, bool>(2)?,
+                                r.get::<_, bool>(3)?,
+                            ),
                         ))
                     })
                     .and_then(|rows| rows.collect::<crate::db::Result<HashMap<_, _>>>())
@@ -12954,7 +13012,7 @@ impl AppStore {
                     installation.last_seen_at,
                     market_capable
                         .get(&installation.id)
-                        .is_some_and(|(_, listed)| *listed),
+                        .is_some_and(|(_, _, protected)| *protected),
                     config.client_stale_secs,
                 )
                 .map(|cleanup_at| (installation.id.clone(), cleanup_at))
@@ -12967,7 +13025,7 @@ impl AppStore {
                     installation.last_seen_at,
                     market_capable
                         .get(&installation.id)
-                        .is_some_and(|(_, listed)| *listed),
+                        .is_some_and(|(_, _, protected)| *protected),
                     config.client_installation_retention_secs,
                 )
                 .map(|removal_at| (installation.id.clone(), removal_at))
@@ -13002,10 +13060,10 @@ impl AppStore {
             installation_views.push(InstallationView {
                 market_lease_v1: market_capable
                     .get(&installation.id)
-                    .is_some_and(|(capable, _)| *capable),
+                    .is_some_and(|(capable, _, _)| *capable),
                 market_listed: market_capable
                     .get(&installation.id)
-                    .is_some_and(|(_, listed)| *listed),
+                    .is_some_and(|(_, listed, _)| *listed),
                 id: installation.id.clone(),
                 platform: installation.platform.clone(),
                 app_version: installation.app_version.clone(),
@@ -13117,7 +13175,8 @@ impl AppStore {
                 let share_owner_email = match lease_bound_shares.get(&share.share_id) {
                     Some((buyer, seller))
                         if !viewer_is_admin
-                            && viewer_id.is_none_or(|viewer| viewer != buyer && viewer != seller) =>
+                            && viewer_id
+                                .is_none_or(|viewer| viewer != buyer && viewer != seller) =>
                     {
                         share.owner_email.as_deref().map(mask_email)
                     }
@@ -13734,7 +13793,7 @@ impl AppStore {
                     .prepare(
                         "SELECT i.id FROM installations i
                          WHERE i.last_seen_at < ?1
-                           AND NOT EXISTS(SELECT 1 FROM online_client_listings ml WHERE ml.installation_id=i.id AND ml.state!='unlisted')
+                           AND NOT EXISTS(SELECT 1 FROM online_client_protection ml WHERE ml.installation_id=i.id)
                            AND NOT EXISTS (
                                SELECT 1 FROM client_notification_events e
                                WHERE e.installation_id = i.id
@@ -13774,7 +13833,7 @@ impl AppStore {
                          FROM shares s
                          INNER JOIN installations i ON i.id = s.installation_id
                          WHERE i.last_seen_at < ?1
-                           AND NOT EXISTS(SELECT 1 FROM online_client_listings ml WHERE ml.installation_id=i.id AND ml.state!='unlisted')",
+                           AND NOT EXISTS(SELECT 1 FROM online_client_protection ml WHERE ml.installation_id=i.id)",
                     )
                     .map_err(|e| {
                         AppError::Internal(format!("prepare stale client shares failed: {e}"))
@@ -13806,7 +13865,7 @@ impl AppStore {
                      WHERE installation_id IN (
                          SELECT id FROM installations
                          WHERE last_seen_at < ?1
-                           AND NOT EXISTS(SELECT 1 FROM online_client_listings ml WHERE ml.installation_id=installations.id AND ml.state!='unlisted')
+                           AND NOT EXISTS(SELECT 1 FROM online_client_protection ml WHERE ml.installation_id=installations.id)
                      )",
                     params![stale_cutoff],
                 )
@@ -17937,6 +17996,11 @@ pub(crate) fn purge_installation_data_tx(
     conn: &Connection,
     installation_id: &str,
 ) -> Result<(), AppError> {
+    // Runtime GC must never relinquish identity or the reserved Client host.
+    conn.execute("UPDATE client_identities SET offline_episode=max(offline_episode,COALESCE((SELECT offline_episode FROM installation_notification_state WHERE installation_id=?1),0)) WHERE installation_id=?1",params![installation_id])
+        .map_err(|e|AppError::Internal(format!("preserve notification epoch: {e}")))?;
+    conn.execute("UPDATE public_hosts SET lifecycle='disabled',revision=revision+1,updated_at=?2 WHERE kind='client' AND subject_id=?1 AND lifecycle='active'", params![installation_id, Utc::now().to_rfc3339()])
+        .map_err(|e| AppError::Internal(format!("disable dormant Client host failed: {e}")))?;
     client_chat::archive_room_for_installation_tx(conn, installation_id, Utc::now())?;
     let share_ids = {
         let mut stmt = conn
@@ -17993,11 +18057,7 @@ pub(crate) fn purge_installation_data_tx(
         .map_err(|e| AppError::Internal(format!("verify installation shares purge failed: {e}")))?,
         0
     );
-    conn.execute(
-        "DELETE FROM installation_health_checks WHERE installation_id = ?1",
-        params![installation_id],
-    )
-    .map_err(|e| AppError::Internal(format!("delete installation health checks failed: {e}")))?;
+    // Health facts expire under their own retention policy, independently of runtime GC.
     conn.execute(
         "DELETE FROM installation_client_tunnels WHERE installation_id = ?1",
         params![installation_id],
@@ -27510,7 +27570,7 @@ fn ensure_takeover_client_market_ready_tx(
     source_installation_id: &str,
 ) -> Result<(), AppError> {
     let listed: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id IN (?1,?2) AND state!='unlisted')",
+        "SELECT EXISTS(SELECT 1 FROM online_client_protection WHERE installation_id IN (?1,?2)) OR EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id IN (?1,?2) AND unlist_pending=1)",
         params![target_installation_id,source_installation_id], |row| row.get(0),
     ).map_err(|error| AppError::Internal(format!("check listed Client identity: {error}")))?;
     if listed {
@@ -44638,146 +44698,146 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn retained_audit_does_not_suppress_same_key_reregistration_lifecycle() {
-        let config = enabled_notification_config("notification-reregister-lifecycle");
-        let store = AppStore::new(&config).expect("create store");
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let policy = notification_policy(&config);
-        let first = register_with_key(&store, &signing_key, "1.0.0").await;
+    async fn same_key_restores_original_identity_domain_and_notification_epoch() {
+        let (store, config) = setup_store("identity-restores-domain").await;
+        let key = insert_signed_installation(&store, "durable-client").await;
+        claim_setup_client_tunnel(&store, &config, &key, "durable-client", "durable-host").await;
         {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE installations SET owner_email = 'owner@example.com', owner_verified_at = ?2
-                 WHERE id = ?1",
-                params![first.installation_id, Utc::now().to_rfc3339()],
-            )
-            .expect("bind first lifecycle owner");
+            let c = store.conn.lock().await;
+            insert_installation_notification_baseline(&c, "durable-client", Utc::now()).unwrap();
+            c.execute("UPDATE installation_notification_state SET offline_episode=7 WHERE installation_id='durable-client'",[]).unwrap();
+            purge_installation_data_tx(&c, "durable-client").unwrap();
+            assert!(get_installation(&c, "durable-client").unwrap().is_none());
+            assert_eq!(
+                crate::public_hosts::get_by_label(&c, "durable-host")
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle,
+                crate::public_hosts::PublicHostLifecycle::Disabled
+            );
         }
-        insert_setup_client_tunnel(&store, &first.installation_id, "firstlifecycle").await;
-        let first_setup = signed_setup_completed_request(
-            &signing_key,
-            &first.installation_id,
-            setup_completed_payload(&Uuid::new_v4().to_string(), "p******w"),
-            Utc::now().timestamp_millis(),
-            "first-lifecycle-setup",
-        );
-        store
-            .complete_installation_setup(first_setup)
-            .await
-            .expect("complete first lifecycle setup");
-        let first_seen = Utc::now();
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE installation_notification_state
-                 SET monitoring_enabled = 1, presence_state = 'online',
-                     last_heartbeat_at = ?2
-                 WHERE installation_id = ?1",
-                params![first.installation_id, first_seen.to_rfc3339()],
-            )
-            .expect("enable first lifecycle monitoring");
-        }
-        store
-            .reconcile_client_notification_events(
-                &policy,
-                first_seen + Duration::seconds(policy.offline_alert_secs + 1),
+        let restored = store
+            .register_installation(
+                registration_request(&key, "2.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
             )
             .await
-            .expect("materialize first offline episode");
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE client_notification_events
-                 SET status = 'dead_letter', updated_at = ?2
-                 WHERE installation_id = ?1",
-                params![first.installation_id, Utc::now().to_rfc3339()],
+            .unwrap();
+        assert_eq!(restored.installation_id, "durable-client");
+        assert_ne!(restored.control_secret, "control-durable-client");
+        claim_setup_client_tunnel(&store, &config, &key, "durable-client", "durable-host").await;
+        let repeat = store
+            .register_installation(
+                registration_request(&key, "2.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
             )
-            .expect("make first lifecycle audit terminal");
-            purge_installation_data_tx(&conn, &first.installation_id)
-                .expect("purge first installation while retaining audit");
-        }
+            .await
+            .unwrap();
+        assert_eq!(repeat.installation_id, restored.installation_id);
+        assert_eq!(repeat.control_secret, restored.control_secret);
+        let c = store.conn.lock().await;
+        let owner = get_installation(&c, "durable-client").unwrap().unwrap();
+        assert_eq!(owner.owner_email.as_deref(), Some("owner@example.com"));
+        assert!(owner.client_activated_at.is_some());
+        let epoch:i64=c.query_row("SELECT offline_episode FROM installation_notification_state WHERE installation_id='durable-client'",[],|r|r.get(0)).unwrap();
+        assert_eq!(epoch, 7);
+        drop(c);
+        let _ = std::fs::remove_file(config.database.path);
+    }
 
-        let second = register_with_key(&store, &signing_key, "2.0.0").await;
-        assert_ne!(first.installation_id, second.installation_id);
+    #[tokio::test]
+    async fn historical_identity_repair_is_previewed_audited_and_repeatable() {
+        let (store, config) = setup_store("legacy-identity-recovery").await;
+        let original = Uuid::new_v4().to_string();
+        let key = insert_signed_installation(&store, &original).await;
+        claim_setup_client_tunnel(&store, &config, &key, &original, "legacy-recover").await;
+        let revision = {
+            let c = store.conn.lock().await;
+            purge_installation_data_tx(&c, &original).unwrap();
+            c.execute(
+                "DELETE FROM client_identities WHERE installation_id=?1",
+                params![original],
+            )
+            .unwrap();
+            crate::public_hosts::get_by_label(&c, "legacy-recover")
+                .unwrap()
+                .unwrap()
+                .revision
+        };
+        let replacement = register_with_key(&store, &key, "2.0.0").await;
+        assert_ne!(replacement.installation_id, original);
         {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE installations SET owner_email = 'owner@example.com', owner_verified_at = ?2
-                 WHERE id = ?1",
-                params![second.installation_id, Utc::now().to_rfc3339()],
-            )
-            .expect("bind second lifecycle owner");
+            let c = store.conn.lock().await;
+            c.execute("UPDATE installations SET owner_email='owner@example.com',owner_verified_at=?2 WHERE id=?1",params![replacement.installation_id,Utc::now().to_rfc3339()]).unwrap();
         }
-        insert_setup_client_tunnel(&store, &second.installation_id, "secondlifecycle").await;
-        let second_setup = signed_setup_completed_request(
-            &signing_key,
-            &second.installation_id,
-            setup_completed_payload(&Uuid::new_v4().to_string(), "s******t"),
-            Utc::now().timestamp_millis(),
-            "second-lifecycle-setup",
-        );
-        store
-            .complete_installation_setup(second_setup)
+        let request = |apply, public_key| ClientIdentityRecoveryRequest {
+            original_installation_id: original.clone(),
+            replacement_installation_id: replacement.installation_id.clone(),
+            public_key,
+            subdomain: "legacy-recover".into(),
+            expected_host_revision: revision,
+            evidence: "verified offline backup sha256 evidence".into(),
+            apply,
+        };
+        let preview = store
+            .recover_client_identity("admin@example.com", request(false, public_key_b64(&key)))
             .await
-            .expect("complete second lifecycle setup");
-        let second_seen = Utc::now();
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE installation_notification_state
-                 SET monitoring_enabled = 1, presence_state = 'online',
-                     last_heartbeat_at = ?2
-                 WHERE installation_id = ?1",
-                params![second.installation_id, second_seen.to_rfc3339()],
-            )
-            .expect("enable second lifecycle monitoring");
-        }
-        store
-            .reconcile_client_notification_events(
-                &policy,
-                second_seen + Duration::seconds(policy.offline_alert_secs + 1),
-            )
-            .await
-            .expect("materialize second offline episode");
-
-        let conn = store.conn.lock().await;
-        let registration_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM client_notification_events
-                 WHERE kind = 'client_registered'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count registration audit rows");
-        let offline_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM client_notification_events
-                 WHERE kind = 'client_offline'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count offline audit rows");
-        let second_keys = conn
-            .prepare(
-                "SELECT dedupe_key FROM client_notification_events
-                 WHERE installation_id = ?1 ORDER BY kind",
-            )
-            .expect("prepare second lifecycle keys")
-            .query_map(params![second.installation_id], |row| {
-                row.get::<_, String>(0)
-            })
-            .expect("query second lifecycle keys")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read second lifecycle keys");
-        assert_eq!(registration_count, 2);
-        assert_eq!(offline_count, 2);
+            .unwrap();
+        assert_eq!(preview["applied"], false);
         assert!(
-            second_keys
-                .iter()
-                .all(|key| key.contains(&second.installation_id))
+            get_installation(&*store.conn.lock().await, &replacement.installation_id)
+                .unwrap()
+                .is_some()
         );
-        drop(conn);
-        let _ = std::fs::remove_file(&config.database.path);
+        let other = SigningKey::generate(&mut OsRng);
+        assert!(
+            store
+                .recover_client_identity("admin@example.com", request(true, public_key_b64(&other)))
+                .await
+                .is_err()
+        );
+        let applied = store
+            .recover_client_identity("admin@example.com", request(true, public_key_b64(&key)))
+            .await
+            .unwrap();
+        assert_eq!(applied["applied"], true);
+        let restored = register_with_key(&store, &key, "2.0.0").await;
+        assert_eq!(restored.installation_id, original);
+        assert_eq!(
+            restored.previous_installation_ids,
+            vec![replacement.installation_id.clone()]
+        );
+        assert_eq!(restored.control_secret, replacement.control_secret);
+        assert_eq!(
+            store
+                .recover_client_identity("admin@example.com", request(true, public_key_b64(&key)))
+                .await
+                .unwrap()["alreadyApplied"],
+            true
+        );
+        let c = store.conn.lock().await;
+        assert!(
+            get_installation(&c, &replacement.installation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM admin_audit_log WHERE action='client_identity.recover'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(c);
+        let _ = std::fs::remove_file(config.database.path);
     }
 
     #[tokio::test]

@@ -60,7 +60,14 @@ pub(super) fn automatic_exit_tx(c: &Connection, id: &str, cutoff: i64) -> Result
         .market()?;
     let at = iso(cutoff)?;
     if reclaimed {
-        crate::client_market_termination::accept_tx(c, id, Some(&seller), "provider_reclaim", None, &at)
+        crate::client_market_termination::accept_tx(
+            c,
+            id,
+            Some(&seller),
+            "provider_reclaim",
+            None,
+            &at,
+        )
     } else if trial_done {
         crate::client_market_termination::accept_tx(c, id, None, "trial_completed", None, &at)
     } else {
@@ -201,7 +208,7 @@ fn take_work(c: &Connection, id: &str) -> Result<(i64, Option<Pending>, Value), 
     )
     .market()?;
     if p.is_some() {
-        c.execute("UPDATE online_client_operations SET next_attempt=unixepoch()+min(120,5*(attempts+1)),attempts=attempts+1 WHERE installation_id=?1",params![id]).market()?;
+        c.execute("UPDATE online_client_operations SET next_attempt=unixepoch()+min(120,5*(attempts+1)),attempts=attempts+1,last_attempt_at=unixepoch() WHERE installation_id=?1",params![id]).market()?;
     }
     let mut ack=c.query_row("SELECT r.id,r.receipt_ack_json FROM online_client_leases r WHERE installation_id=?1 AND released_at IS NULL",params![id],|r|Ok(json!({"leaseId":r.get::<_,String>(0)?,"received":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or_default()}))).optional().market()?.unwrap_or_else(||json!({}));
     let refresh_hardware:bool=c.query_row("SELECT coalesce(hardware_at,0)<=unixepoch()-3600 FROM online_client_listings WHERE installation_id=?1",params![id],|r|r.get(0)).market()?;
@@ -330,20 +337,9 @@ fn release(c: &Connection, l: &Rental, now: i64) -> Result<(), AppError> {
         )
         .market()?;
     if unlist {
-        let seq: Option<i64> = c
-            .query_row(
-                "UPDATE online_client_listings SET state='unlocking',revision=revision+1,sequence=sequence+1,
-                     challenge=NULL,paused_at=NULL
-                 WHERE installation_id=?1 AND state='listed' RETURNING sequence",
-                params![installation],
-                |r| r.get(0),
-            )
-            .optional()
-            .market()?;
-        if let Some(seq) = seq {
-            queue(c, &installation, seq, json!({"operation":"unlist"}))?;
-        }
+        lifecycle::request_unlist(c, &installation, now)?;
     }
+    lifecycle::schedule_unlist(c, &installation)?;
     Ok(())
 }
 
@@ -454,13 +450,14 @@ fn apply_status(
             params![id],
         )
         .market()?;
-    } else if mode == "unlocking"
+    } else if mode == "unlisted"
+        && rental.is_none()
         && st.listed_owner.is_none()
         && grant.is_none()
         && running.is_none()
     {
         c.execute(
-            "UPDATE online_client_listings SET state='unlisted' WHERE installation_id=?1",
+            "UPDATE online_client_listings SET unlist_pending=0 WHERE installation_id=?1 AND state='unlisted'",
             params![id],
         )
         .market()?;
@@ -582,9 +579,26 @@ fn sample(c: &Connection, id: &str, healthy: bool, now: i64) -> Result<(), AppEr
     Ok(())
 }
 async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
+    if s.proxy
+        .active_client_route_for_installation(&id)
+        .await
+        .is_none()
+    {
+        let c = s.store.conn.lock().await;
+        let tx = c.transaction().market()?;
+        tx.execute("UPDATE online_client_operations SET waiting_reconnect=1,next_attempt=unixepoch()+300,last_error='tunnel_offline' WHERE installation_id=?1",params![id]).market()?;
+        tx.execute("UPDATE online_client_listings SET next_probe=unixepoch()+300,probe_error='tunnel_offline' WHERE installation_id=?1",params![id]).market()?;
+        let monitored:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id=?1 AND state!='unlisted') OR EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)",params![id],|r|r.get(0)).market()?;
+        if monitored {
+            sample(&tx, &id, false, stamp())?;
+        }
+        tx.commit().market()?;
+        return Ok(());
+    }
     let (seq, p, ack) = {
         let c = s.store.conn.lock().await;
         let tx = c.transaction().market()?;
+        lifecycle::schedule_unlist(&tx, &id)?;
         let w = take_work(&tx, &id)?;
         tx.commit().market()?;
         w
@@ -626,6 +640,10 @@ async fn probe(s: &ServerState, id: String) -> Result<(), AppError> {
                 // never arrived. Its replay is subsequently stale.
                 command["action"] =
                     json!({"operation":"cancel","leaseId":command["action"]["leaseId"]});
+            }
+            {
+                let c = s.store.conn.lock().await;
+                c.execute("UPDATE online_client_operations SET delivery_attempts=delivery_attempts+1,last_attempt_at=unixepoch(),waiting_reconnect=0 WHERE installation_id=?1 AND sequence=?2",params![id,p.seq]).market()?;
             }
             st = rpc(s, &id, "/_ctl/market/command", command).await;
         }
@@ -698,6 +716,24 @@ pub(crate) async fn run(s: ServerState) -> anyhow::Result<()> {
     let mut ending_cursor = String::new();
     loop {
         let now = tick.tick().await;
+        // Observe route activation without coupling SSH registration to SQL.
+        // Only dormant outboxes are woken; offline checks never count as sends.
+        let connected = s.proxy.active_client_installation_ids().await;
+        {
+            let c = s.store.conn.lock().await;
+            let wake_result = (|| -> Result<(), AppError> {
+                for id in connected {
+                    let woke=c.execute("UPDATE online_client_operations SET waiting_reconnect=0,next_attempt=0 WHERE installation_id=?1 AND waiting_reconnect=1",params![id]).market()?;
+                    if woke > 0 {
+                        c.execute("UPDATE online_client_listings SET next_probe=0 WHERE installation_id=?1",params![id]).market()?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = wake_result {
+                tracing::warn!(%error,"Client outbox reconnect wakeup deferred");
+            }
+        }
         let prune = now >= next_prune;
         match cycle(&s, prune, &mut ending_cursor).await {
             Ok(()) if prune => next_prune = now + Delay::from_secs(900),
@@ -765,7 +801,11 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
                 )
                 .market()?;
             stmt.query_map(params![now], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })
             .market()?
             .collect::<crate::db::Result<Vec<_>>>()
@@ -774,7 +814,13 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
         let reclaimed = !reclaims.is_empty();
         for (installation, id, reason) in reclaims {
             super::seller::deny_buyer_if_requested_tx(&tx, &id)?;
-            super::seller::lease_event_tx(&tx, &id, &format!("reclaim:{now}:executed"), "reclaim_executed", now)?;
+            super::seller::lease_event_tx(
+                &tx,
+                &id,
+                &format!("reclaim:{now}:executed"),
+                "reclaim_executed",
+                now,
+            )?;
             super::seller::notify_tenant_tx(
                 &tx,
                 &id,
@@ -826,7 +872,7 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
         let tx = c.transaction().market()?;
         let ids = {
             let mut stmt=tx.prepare("SELECT l.installation_id FROM online_client_listings l LEFT JOIN online_client_operations o USING(installation_id)
-            WHERE l.state!='unlisted' AND (l.state!='locking' OR l.check_json IS NOT NULL) AND (l.next_probe<=unixepoch() OR o.next_attempt<=unixepoch())
+            WHERE (l.state!='unlisted' OR l.unlist_pending=1 OR EXISTS(SELECT 1 FROM online_client_leases r WHERE r.installation_id=l.installation_id AND r.released_at IS NULL)) AND (l.state!='locking' OR l.check_json IS NOT NULL) AND (l.next_probe<=unixepoch() OR o.next_attempt<=unixepoch())
             ORDER BY min(l.next_probe,coalesce(o.next_attempt,l.next_probe)),l.installation_id LIMIT 96").market()?;
             stmt.query_map([], |r| r.get::<_, String>(0))
                 .market()?
@@ -931,7 +977,13 @@ async fn recheck_egress(s: &ServerState, id: &str) -> Result<(), AppError> {
             .market()?;
         if let Some(lease) = lease {
             let now = stamp();
-            super::seller::lease_event_tx(&tx, &lease, &format!("egress:{now}"), "egress_changed", now)?;
+            super::seller::lease_event_tx(
+                &tx,
+                &lease,
+                &format!("egress:{now}"),
+                "egress_changed",
+                now,
+            )?;
             super::seller::notify_tenant_tx(
                 &tx,
                 &lease,
@@ -1041,6 +1093,79 @@ mod tests {
             events: vec![],
             version: "test".into(),
         }
+    }
+
+    #[test]
+    fn offline_unlisting_is_immediate_idempotent_and_invalidates_quotes() {
+        let c = crate::test_support::database().unwrap();
+        listed(&c);
+        let tx = c.transaction().unwrap();
+        let buyer = actor("buyer");
+        let quote = offer(&tx, &buyer);
+        lifecycle::request_unlist(&tx, "physical", stamp()).unwrap();
+        let state:(String,bool,i64)=tx.query_row("SELECT state,unlist_pending,sequence FROM online_client_listings WHERE installation_id='physical'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(state, ("unlisted".into(), true, 2));
+        assert!(commit_quote(&tx, &quote, &buyer, false).is_err());
+        lifecycle::request_unlist(&tx, "physical", stamp()).unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT sequence FROM online_client_listings WHERE installation_id='physical'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        let mut stale = status(1, None);
+        stale.listed_owner = None;
+        assert!(!apply_status(&tx, "physical", 2, &stale, stamp()).unwrap());
+        assert!(tx.query_row("SELECT unlist_pending FROM online_client_listings WHERE installation_id='physical'",[],|r|r.get::<_,bool>(0)).unwrap());
+        let mut confirmed = status(2, None);
+        confirmed.listed_owner = None;
+        assert!(apply_status(&tx, "physical", 2, &confirmed, stamp()).unwrap());
+        assert!(!tx.query_row("SELECT unlist_pending FROM online_client_listings WHERE installation_id='physical'",[],|r|r.get::<_,bool>(0)).unwrap());
+    }
+
+    #[test]
+    fn unlisting_an_active_rental_preserves_its_command_and_identity_protection() {
+        let c = crate::test_support::database().unwrap();
+        listed(&c);
+        crate::test_support::online_lease(
+            &c,
+            "active-lease",
+            "physical",
+            "owner",
+            "buyer",
+            &iso(stamp()).unwrap(),
+        );
+        c.execute(
+            "UPDATE online_client_listings SET sequence=2 WHERE installation_id='physical'",
+            [],
+        )
+        .unwrap();
+        queue(
+            &c,
+            "physical",
+            2,
+            json!({"operation":"extend","leaseId":"active-lease","expiresAt":stamp()+3600}),
+        )
+        .unwrap();
+        let before:String=c.query_row("SELECT request_json FROM online_client_operations WHERE installation_id='physical'",[],|r|r.get(0)).unwrap();
+        lifecycle::request_unlist(&c, "physical", stamp()).unwrap();
+        let after:String=c.query_row("SELECT request_json FROM online_client_operations WHERE installation_id='physical'",[],|r|r.get(0)).unwrap();
+        assert_eq!(before, after);
+        assert!(current(&c, "physical").unwrap().is_some());
+        assert!(
+            c.execute(
+                "UPDATE installations SET owner_email='intruder@example.org' WHERE id='physical'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            c.execute("DELETE FROM installations WHERE id='physical'", [])
+                .is_err()
+        );
     }
     #[test]
     fn legacy_management_promotes_only_after_the_current_grant_is_reconciled() {
@@ -1417,7 +1542,10 @@ mod tests {
             |r| Ok([r.get::<_,i64>(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?]),
         ).unwrap();
         assert_eq!(commission, [1, 1000, 1, 1000, 1, 1000]);
-        assert_eq!(commit_quote(&tx, &quote, &buyer, false).unwrap()["leaseId"], l.id);
+        assert_eq!(
+            commit_quote(&tx, &quote, &buyer, false).unwrap()["leaseId"],
+            l.id
+        );
         for (hour, success) in [(0, 10), (1, 9)] {
             for slot in 0..12 {
                 sample(

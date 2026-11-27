@@ -276,16 +276,20 @@ fn detail_tx(
     } else {
         None
     };
-    let rental = rental.map(|mut rental| -> Result<Value, AppError> {
-        if let (Some(lease), Some(from)) = (rental["leaseId"].as_str(), rental["billingFrom"].as_i64()) {
-            if let Some(billed) = billed_time_tx(conn, lease, from)? {
-                rental["availableSeconds"] = json!(billed.available_seconds);
-                rental["unavailableSeconds"] = json!(billed.unavailable_seconds);
-                rental["settledThrough"] = json!(billed.settled_through);
+    let rental = rental
+        .map(|mut rental| -> Result<Value, AppError> {
+            if let (Some(lease), Some(from)) =
+                (rental["leaseId"].as_str(), rental["billingFrom"].as_i64())
+            {
+                if let Some(billed) = billed_time_tx(conn, lease, from)? {
+                    rental["availableSeconds"] = json!(billed.available_seconds);
+                    rental["unavailableSeconds"] = json!(billed.unavailable_seconds);
+                    rental["settledThrough"] = json!(billed.settled_through);
+                }
             }
-        }
-        Ok(rental)
-    }).transpose()?;
+            Ok(rental)
+        })
+        .transpose()?;
     let periods: Vec<_> = detail["periods"]
         .as_array()
         .into_iter()
@@ -333,7 +337,11 @@ pub(crate) struct BilledTime {
     pub settled_through: Option<String>,
 }
 
-pub(crate) fn billed_time_tx(conn: &Connection, lease: &str, from: i64) -> Result<Option<BilledTime>, AppError> {
+pub(crate) fn billed_time_tx(
+    conn: &Connection,
+    lease: &str,
+    from: i64,
+) -> Result<Option<BilledTime>, AppError> {
     conn.query_row(
         "SELECT count(DISTINCT k.id),
                 coalesce(sum(CASE WHEN e.service_available=1
@@ -346,11 +354,24 @@ pub(crate) fn billed_time_tx(conn: &Connection, lease: &str, from: i64) -> Resul
             AND e.source_kind='client_host_health' AND unixepoch(e.ended_at)>?2
           WHERE k.product_kind='client_host' AND k.product_ref=?1",
         params![lease, from],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?)),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        },
     )
-    .map(|(contracts, available_seconds, unavailable_seconds, settled_through)| {
-        (contracts > 0).then_some(BilledTime { available_seconds, unavailable_seconds, settled_through })
-    })
+    .map(
+        |(contracts, available_seconds, unavailable_seconds, settled_through)| {
+            (contracts > 0).then_some(BilledTime {
+                available_seconds,
+                unavailable_seconds,
+                settled_through,
+            })
+        },
+    )
     .map_err(db_error("read billed Client time"))
 }
 

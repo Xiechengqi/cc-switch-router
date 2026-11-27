@@ -48,6 +48,15 @@ export type OnlineListing = {
   sellerEmail?: string;
 };
 
+export type OnlineListingSyncStatus = {
+  state: string;
+  hostSyncState: "confirmed" | "pending" | "waiting_reconnect" | "after_rental";
+  unlistedAt: number | null;
+  commandAttempts: number;
+  lastError: string | null;
+  lastAttemptAt: number | null;
+};
+
 export type ListingBlocker =
   | "already_listed" | "listing_changed" | "owner_unverified" | "inactive" | "upgrade_required"
   | "offline" | "share_in_use" | "workspace_busy" | "control_unavailable"

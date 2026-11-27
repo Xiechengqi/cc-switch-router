@@ -10,7 +10,9 @@ pub(super) fn normalize_title(raw: Option<&str>) -> Result<Option<String>, AppEr
     let Some(title) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    if title.chars().count() > 30 || title.chars().any(char::is_control) || looks_like_contact(title)
+    if title.chars().count() > 30
+        || title.chars().any(char::is_control)
+        || looks_like_contact(title)
     {
         return Err(AppError::coded_bad_request(
             "CLIENT_LISTING_TITLE_INVALID",
@@ -37,7 +39,11 @@ fn looks_like_contact(title: &str) -> bool {
 }
 
 /// Shared rental terms validation for listing and later offer changes.
-pub(super) fn validate_terms(price: i64, free_days: Option<u32>, trial_days: u32) -> Result<(), AppError> {
+pub(super) fn validate_terms(
+    price: i64,
+    free_days: Option<u32>,
+    trial_days: u32,
+) -> Result<(), AppError> {
     if !(0..=100_000_000).contains(&price)
         || free_days.is_some_and(|n| !(1..=365).contains(&n))
         || trial_days > 30
@@ -90,23 +96,26 @@ pub(super) fn deny_buyer_if_requested_tx(c: &Connection, lease: &str) -> Result<
     // The access decision is a courtesy to the seller: if it cannot be written
     // (e.g. a legacy email), the reclaim and the tenant's exit still proceed.
     c.execute_batch("SAVEPOINT client_reclaim_deny").market()?;
-    let result = [crate::market_access::PRICING_FREE, crate::market_access::PRICING_PAID]
-        .into_iter()
-        .try_for_each(|pricing| {
-            crate::market_access::set_product_access_decision_tx(
-                c,
-                &seller,
-                &seller_email,
-                &buyer,
-                &buyer_email,
-                crate::market_access::PRODUCT_CLIENT_HOST,
-                pricing,
-                crate::market_access::DECISION_DENY,
-                &seller,
-                &at,
-            )
-            .map(drop)
-        });
+    let result = [
+        crate::market_access::PRICING_FREE,
+        crate::market_access::PRICING_PAID,
+    ]
+    .into_iter()
+    .try_for_each(|pricing| {
+        crate::market_access::set_product_access_decision_tx(
+            c,
+            &seller,
+            &seller_email,
+            &buyer,
+            &buyer_email,
+            crate::market_access::PRODUCT_CLIENT_HOST,
+            pricing,
+            crate::market_access::DECISION_DENY,
+            &seller,
+            &at,
+        )
+        .map(drop)
+    });
     match result {
         Ok(()) => c.execute_batch("RELEASE client_reclaim_deny").market()?,
         Err(error) => {
@@ -119,7 +128,13 @@ pub(super) fn deny_buyer_if_requested_tx(c: &Connection, lease: &str) -> Result<
 }
 
 /// Rental history visible to both parties in the lease's event list.
-pub(super) fn lease_event_tx(c: &Connection, lease: &str, key: &str, kind: &str, at: i64) -> Result<(), AppError> {
+pub(super) fn lease_event_tx(
+    c: &Connection,
+    lease: &str,
+    key: &str,
+    kind: &str,
+    at: i64,
+) -> Result<(), AppError> {
     c.execute(
         "INSERT OR IGNORE INTO online_client_events(lease_id,event_key,kind,recorded_at) VALUES(?1,?2,?3,?4)",
         params![lease, key, kind, at],
@@ -153,7 +168,10 @@ pub(super) async fn reclaim(
     let a = actor(&s, &h).await?;
     let note = v.note.trim();
     if !matches!(v.mode.as_str(), "notice" | "immediate")
-        || !matches!(v.reason.as_str(), "need_machine" | "tenant_violation" | "other")
+        || !matches!(
+            v.reason.as_str(),
+            "need_machine" | "tenant_violation" | "other"
+        )
         || note.chars().count() > 2000
     {
         return Err(AppError::BadRequest("invalid reclaim request".into()));
@@ -262,12 +280,24 @@ pub(super) async fn reclaim(
         params![lease, at],
     )
     .market()?;
-    lease_event_tx(&tx, &lease, &format!("reclaim:{now}:scheduled"), "reclaim_scheduled", now)?;
+    lease_event_tx(
+        &tx,
+        &lease,
+        &format!("reclaim:{now}:scheduled"),
+        "reclaim_scheduled",
+        now,
+    )?;
     if effective <= now {
         // "Don't accept this tenant again" takes effect when the reclaim
         // happens, so a cancelled notice leaves the buyer's access untouched.
         deny_buyer_if_requested_tx(&tx, &lease)?;
-        lease_event_tx(&tx, &lease, &format!("reclaim:{now}:executed"), "reclaim_executed", now)?;
+        lease_event_tx(
+            &tx,
+            &lease,
+            &format!("reclaim:{now}:executed"),
+            "reclaim_executed",
+            now,
+        )?;
         notify_tenant_tx(
             &tx,
             &lease,
@@ -289,7 +319,9 @@ pub(super) async fn reclaim(
     }
     tx.commit().market()?;
     s.dashboard_cache.invalidate();
-    Ok(Json(json!({"leaseId": lease, "reclaimEffectiveAt": effective, "state": if effective <= now { "ending" } else { state.as_str() }})))
+    Ok(Json(
+        json!({"leaseId": lease, "reclaimEffectiveAt": effective, "state": if effective <= now { "ending" } else { state.as_str() }}),
+    ))
 }
 
 pub(super) async fn cancel_reclaim(
@@ -339,7 +371,13 @@ pub(super) async fn cancel_reclaim(
         params![lease],
     )
     .market()?;
-    lease_event_tx(&tx, &lease, &format!("reclaim:{now}:cancelled"), "reclaim_cancelled", now)?;
+    lease_event_tx(
+        &tx,
+        &lease,
+        &format!("reclaim:{now}:cancelled"),
+        "reclaim_cancelled",
+        now,
+    )?;
     notify_tenant_tx(
         &tx,
         &lease,
@@ -350,7 +388,9 @@ pub(super) async fn cancel_reclaim(
     )?;
     tx.commit().market()?;
     s.dashboard_cache.invalidate();
-    Ok(Json(json!({"leaseId": lease, "cancelled": true, "renewalRestored": restored || continue_restored})))
+    Ok(Json(
+        json!({"leaseId": lease, "cancelled": true, "renewalRestored": restored || continue_restored}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -377,7 +417,11 @@ pub(super) async fn update_listing(
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
     // Going paid claims the seller's provider identity, as a paid listing does.
-    let tx = if v.cycle_price_minor > 0 { super::ensure_paid_provider(&c, tx, &a)? } else { tx };
+    let tx = if v.cycle_price_minor > 0 {
+        super::ensure_paid_provider(&c, tx, &a)?
+    } else {
+        tx
+    };
     let current: (i64, Option<u32>, u32) = tx
         .query_row(
             "SELECT cycle_price_minor,free_days,trial_days FROM online_client_listings
@@ -398,12 +442,18 @@ pub(super) async fn update_listing(
     .market()?;
     tx.commit().market()?;
     s.dashboard_cache.invalidate();
-    Ok(Json(json!({"installationId": id, "termsChanged": terms_changed})))
+    Ok(Json(
+        json!({"installationId": id, "termsChanged": terms_changed}),
+    ))
 }
 
 /// Pausing stops new orders and invalidates outstanding quotes. The current
 /// rental, if any, is not affected.
-pub(super) async fn pause(State(s): State<ServerState>, Path(id): Path<String>, h: HeaderMap) -> Reply {
+pub(super) async fn pause(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+) -> Reply {
     let a = actor(&s, &h).await?;
     let c = s.store.conn.lock().await;
     let changed = c
@@ -420,7 +470,11 @@ pub(super) async fn pause(State(s): State<ServerState>, Path(id): Path<String>, 
     Ok(Json(json!({"installationId": id, "paused": true})))
 }
 
-pub(super) async fn resume(State(s): State<ServerState>, Path(id): Path<String>, h: HeaderMap) -> Reply {
+pub(super) async fn resume(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+) -> Reply {
     let a = actor(&s, &h).await?;
     let c = s.store.conn.lock().await;
     let changed = c
@@ -443,12 +497,24 @@ mod tests {
 
     #[test]
     fn titles_are_short_single_line_and_not_contacts() {
-        assert_eq!(normalize_title(Some("  东京 · 稳定在线 ")).unwrap().as_deref(), Some("东京 · 稳定在线"));
+        assert_eq!(
+            normalize_title(Some("  东京 · 稳定在线 "))
+                .unwrap()
+                .as_deref(),
+            Some("东京 · 稳定在线")
+        );
         assert_eq!(normalize_title(Some("   ")).unwrap(), None);
         assert_eq!(normalize_title(None).unwrap(), None);
         assert!(normalize_title(Some(&"长".repeat(31))).is_err());
         assert!(normalize_title(Some(&"长".repeat(30))).is_ok());
-        for bad in ["a\nb", "see https://x.y", "mail me@x.io", "www.shop", "visit example.com", "tab\there"] {
+        for bad in [
+            "a\nb",
+            "see https://x.y",
+            "mail me@x.io",
+            "www.shop",
+            "visit example.com",
+            "tab\there",
+        ] {
             assert!(normalize_title(Some(bad)).is_err(), "{bad}");
         }
         assert!(normalize_title(Some("Tokyo v1.2 x86_64")).is_ok());
@@ -481,8 +547,11 @@ mod tests {
         conn.execute("UPDATE online_client_listings SET paused_at=unixepoch() WHERE installation_id='physical'", [])
             .unwrap();
         assert_eq!(read(), ("paused".to_owned(), "maintaining".to_owned()));
-        conn.execute("UPDATE online_client_listings SET paused_at=NULL WHERE installation_id='physical'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE online_client_listings SET paused_at=NULL WHERE installation_id='physical'",
+            [],
+        )
+        .unwrap();
         assert_eq!(read().0, "available");
         let title = |value: &str| {
             conn.execute(

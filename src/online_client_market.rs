@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+mod lifecycle;
 mod reconcile;
 pub(crate) use reconcile::run;
 mod seller;
@@ -65,7 +66,10 @@ pub fn router() -> Router<ServerState> {
         )
         .route(
             "/v1/client-market/online/installations/:id/listing",
-            post(list).delete(unlist).patch(seller::update_listing),
+            get(listing_status)
+                .post(list)
+                .delete(unlist)
+                .patch(seller::update_listing),
         )
         .route(
             "/v1/client-market/online/installations/:id/listing/pause",
@@ -180,9 +184,9 @@ async fn rpc(s: &ServerState, id: &str, path: &str, body: Value) -> Result<Clien
     }
     Ok(status)
 }
-pub(crate) async fn listed(s: &ServerState, id: &str) -> Result<bool, AppError> {
+pub(crate) async fn management_protected(s: &ServerState, id: &str) -> Result<bool, AppError> {
     let c = s.store.conn.lock().await;
-    c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id=?1 AND state!='unlisted')",
+    c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_protection WHERE installation_id=?1) OR EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id=?1 AND unlist_pending=1)",
         params![id],|r|r.get(0)).market()
 }
 pub(crate) async fn control<T: serde::de::DeserializeOwned>(
@@ -222,7 +226,7 @@ fn stamp() -> i64 {
 }
 fn queue(c: &Connection, id: &str, seq: i64, action: Value) -> Result<(), AppError> {
     c.execute("INSERT INTO online_client_operations(installation_id,sequence,request_json,next_attempt) VALUES(?1,?2,?3,0)
-        ON CONFLICT(installation_id) DO UPDATE SET sequence=excluded.sequence,request_json=excluded.request_json,next_attempt=0,attempts=0,last_error=NULL",
+        ON CONFLICT(installation_id) DO UPDATE SET sequence=excluded.sequence,request_json=excluded.request_json,next_attempt=0,attempts=0,delivery_attempts=0,waiting_reconnect=0,last_attempt_at=NULL,last_error=NULL",
         params![id,seq,json!({"sequence":seq,"action":action}).to_string()]).market()?;
     Ok(())
 }
@@ -249,6 +253,8 @@ struct Readiness {
     capable: bool,
     share_clear: bool,
     unlisted: bool,
+    #[serde(skip_serializing)]
+    host_sync_pending: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -349,6 +355,8 @@ impl Readiness {
             Some(ListingBlocker::UpgradeRequired)
         } else if !self.share_clear {
             Some(ListingBlocker::ShareInUse)
+        } else if self.host_sync_pending {
+            Some(ListingBlocker::ControlUnavailable)
         } else {
             None
         }
@@ -425,10 +433,11 @@ fn readiness(c: &Connection, id: &str, email: &str) -> Result<Readiness, AppErro
         i.market_lease_v1=1, NOT EXISTS(SELECT 1 FROM share_market_listings l WHERE l.installation_id=i.id AND
             (l.status='active' OR EXISTS(SELECT 1 FROM share_market_subscriptions sub WHERE sub.listing_id=l.id AND sub.released_at IS NULL))),
         NOT EXISTS(SELECT 1 FROM online_client_listings l WHERE l.installation_id=i.id AND l.state!='unlisted'
-            AND NOT (l.state='locking' AND l.check_json IS NULL AND l.challenge_until IS NOT NULL AND l.challenge_until<unixepoch()))
+            AND NOT (l.state='locking' AND l.check_json IS NULL AND l.challenge_until IS NOT NULL AND l.challenge_until<unixepoch())),
+        EXISTS(SELECT 1 FROM online_client_listings l WHERE l.installation_id=i.id AND l.unlist_pending=1)
         FROM installations i LEFT JOIN installation_client_tunnels t ON t.installation_id=i.id
         WHERE i.id=?1 AND lower(trim(i.owner_email))=lower(?2)",params![id,email],
-        |r|Ok(Readiness {owner_verified:r.get(0)?,activated:r.get(1)?,capable:r.get(2)?,share_clear:r.get(3)?,unlisted:r.get(4)?}))
+        |r|Ok(Readiness {owner_verified:r.get(0)?,activated:r.get(1)?,capable:r.get(2)?,share_clear:r.get(3)?,unlisted:r.get(4)?,host_sync_pending:r.get(5)?}))
         .optional().market()?.ok_or_else(missing)
 }
 fn listing_provider_transaction<'c>(
@@ -595,7 +604,7 @@ async fn retry(State(s): State<ServerState>, Path(id): Path<String>, headers: He
     let a = actor(&s, &headers).await?;
     let c = s.store.conn.lock().await;
     let rows=c.execute("UPDATE online_client_operations SET next_attempt=0 WHERE installation_id=?1 AND EXISTS
-      (SELECT 1 FROM online_client_listings l WHERE l.installation_id=?1 AND l.seller_id=?2 AND l.state IN ('locking','unlocking') AND l.sequence=online_client_operations.sequence)",params![id,a.user_id]).market()?;
+      (SELECT 1 FROM online_client_listings l WHERE l.installation_id=?1 AND l.seller_id=?2 AND (l.state='locking' OR (l.unlist_pending=1 AND json_extract(online_client_operations.request_json,'$.action.operation')='unlist')) AND l.sequence=online_client_operations.sequence)",params![id,a.user_id]).market()?;
     if rows != 1 {
         return Err(conflict("no pending listing operation"));
     }
@@ -633,7 +642,7 @@ async fn list(
         let changed=tx.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,free_days,trial_days,title,updated_at,challenge,challenge_until)
             VALUES(?1,?2,lower(?3),'locking',1,1,?4,?5,?6,?8,unixepoch(),?7,unixepoch()+30)
             ON CONFLICT(installation_id) DO UPDATE SET state='locking',revision=revision+1,sequence=sequence+1,seller_id=excluded.seller_id,owner_email=excluded.owner_email,
-            cycle_price_minor=excluded.cycle_price_minor,free_days=excluded.free_days,trial_days=excluded.trial_days,title=excluded.title,paused_at=NULL,challenge=excluded.challenge,challenge_until=excluded.challenge_until,egress_ip=NULL,country_code=NULL,check_json=NULL,healthy=0,egress_checked_at=NULL
+            cycle_price_minor=excluded.cycle_price_minor,free_days=excluded.free_days,trial_days=excluded.trial_days,title=excluded.title,paused_at=NULL,challenge=excluded.challenge,challenge_until=excluded.challenge_until,egress_ip=NULL,country_code=NULL,check_json=NULL,healthy=0,egress_checked_at=NULL,unlist_pending=0,unlisted_at=NULL
             WHERE state='unlisted' OR (state='locking' AND challenge_until<unixepoch() AND check_json IS NULL)",
             params![id,a.user_id,a.email,v.cycle_price_minor,v.free_days,v.trial_days,challenge,title]).market()?;
         if changed != 1 {
@@ -731,12 +740,48 @@ async fn unlist(State(s): State<ServerState>, Path(id): Path<String>, h: HeaderM
     let a = actor(&s, &h).await?;
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
-    let seq=tx.query_row("UPDATE online_client_listings SET state='unlocking',revision=revision+1,sequence=sequence+1,challenge=NULL
-        WHERE installation_id=?1 AND seller_id=?2 AND state IN ('listed','locking') AND NOT EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL) RETURNING sequence",
-        params![id,a.user_id],|r|r.get(0)).optional().market()?.ok_or_else(||conflict("finish the rental before unlisting"))?;
-    queue(&tx, &id, seq, json!({"operation":"unlist"}))?;
+    let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM online_client_listings WHERE installation_id=?1 AND seller_id=?2)",params![id,a.user_id],|r|r.get(0)).market()?;
+    if !owned {
+        return Err(missing());
+    }
+    lifecycle::request_unlist(&tx, &id, stamp())?;
     tx.commit().market()?;
-    Ok(Json(json!({"state":"unlocking"})))
+    Ok(Json(json!({"state":"unlisted"})))
+}
+
+/// Owner-only intent/delivery status, available even after runtime GC. It never
+/// brings an unlisted Client back into the public or current selling inventory.
+async fn listing_status(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    h: HeaderMap,
+) -> Reply {
+    let a = actor(&s, &h).await?;
+    let (state, pending, rented, unlisted_at, attempts, last_error, last_attempt) = {
+        let c = s.store.conn.lock().await;
+        c.query_row("SELECT l.state,l.unlist_pending,
+            EXISTS(SELECT 1 FROM online_client_leases r WHERE r.installation_id=l.installation_id AND r.released_at IS NULL),
+            l.unlisted_at,coalesce(o.delivery_attempts,0),o.last_error,o.last_attempt_at
+            FROM online_client_listings l LEFT JOIN online_client_operations o USING(installation_id)
+            WHERE l.installation_id=?1 AND l.seller_id=?2",params![id,a.user_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<i64>>(6)?))).optional().market()?.ok_or_else(missing)?
+    };
+    let connected = s
+        .proxy
+        .active_client_route_for_installation(&id)
+        .await
+        .is_some();
+    let sync = if !pending && state != "locking" {
+        "confirmed"
+    } else if rented {
+        "after_rental"
+    } else if connected {
+        "pending"
+    } else {
+        "waiting_reconnect"
+    };
+    Ok(Json(
+        json!({"state":state,"hostSyncState":sync,"unlistedAt":unlisted_at,"commandAttempts":attempts,"lastError":last_error,"lastAttemptAt":last_attempt}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1153,14 +1198,14 @@ async fn listings(
         "SELECT l.installation_id, l.revision, l.state, l.cycle_price_minor, l.free_days, l.trial_days,
                 l.country_code, l.egress_ip, l.check_json, l.probe_healthy, l.observed_at, l.seller_id IS ?1,
                 l.occupied, t.subdomain, coalesce(i.last_seen_ip!=l.egress_ip,0), mp.id,
-                l.probe_error, o.attempts, i.created_at, l.availability, l.exclusive_management, l.owner_rental,
+                l.probe_error, o.delivery_attempts, i.created_at, l.availability, l.exclusive_management, l.owner_rental,
                 l.title, l.owner_email
          FROM online_client_supply l
          JOIN installations i ON i.id=l.installation_id
          JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
          LEFT JOIN market_provider_profiles mp ON mp.user_id=l.seller_id
          LEFT JOIN online_client_operations o ON o.installation_id=l.installation_id
-         WHERE l.state='listed' OR (l.seller_id=?1 AND l.state!='unlisted')
+         WHERE l.state='listed' OR (l.seller_id=?1 AND (l.state!='unlisted' OR EXISTS(SELECT 1 FROM online_client_leases active WHERE active.installation_id=l.installation_id AND active.released_at IS NULL)))
          ORDER BY (l.availability='available') DESC, i.created_at, l.installation_id"
     ).market()?;
     let rows = stmt.query_map(params![me], |r| {
@@ -1272,7 +1317,7 @@ async fn seller_inventory(State(s): State<ServerState>, headers: HeaderMap) -> R
 fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.alias, r.state, q.cycle_price_minor, r.tenant_email, r.grant_until, r.created_at,
-                CASE WHEN l.seller_id=r.seller_id AND l.state!='unlisted' THEN l.installation_id END,(SELECT t.id FROM client_market_terminations t WHERE t.installation_id=r.id),
+                CASE WHEN l.seller_id=r.seller_id THEN l.installation_id END,(SELECT t.id FROM client_market_terminations t WHERE t.installation_id=r.id),
                 l.title, l.paused_at IS NOT NULL,
                 CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_effective_at END,
                 CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_mode END,
@@ -1329,7 +1374,8 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
     let mut items = items;
     for item in items.iter_mut() {
         if let Some(from) = item.billing_from {
-            if let Some(billed) = crate::client_market_audit::billed_time_tx(conn, &item.id, from)? {
+            if let Some(billed) = crate::client_market_audit::billed_time_tx(conn, &item.id, from)?
+            {
                 item.available_seconds = Some(billed.available_seconds);
                 item.unavailable_seconds = Some(billed.unavailable_seconds);
                 item.settled_through = billed.settled_through;

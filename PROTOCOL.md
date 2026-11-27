@@ -47,6 +47,10 @@ Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请
 
 > `control_secret` 是 Router → Server 方向的认证凭据;Ed25519 私钥是 Server → Router 方向的认证凭据。两者用途不可混用。
 
+Client 公钥与 installationId 的映射持久化在 `client_identities`，普通离线清理只回收运行记录、连接和缓存，不回收身份或域名预留。原密钥签名重新注册恢复原 ID、已验证 Owner 和原子域名。重建运行记录时签发并持久化新的 controlSecret，不恢复旧会话；重复注册取得同一已落库结果。响应可追加 `previousInstallationIds`：仅用于已审计的历史身份修复，Server 不得将未经该别名证明的 ID 变化静默覆盖到已注册身份。封禁和子域名接管的永久 fencing 优先于恢复。
+
+历史孤立域名没有可验证公钥时不自动推断归属。管理员调用 `POST /v1/admin/client-identities/recover`，请求包含 `originalInstallationId`、`replacementInstallationId`、`publicKey`、`subdomain`、`expectedHostRevision`、独立核验的备份 `evidence`，`apply` 默认 false 仅预检。应用要求不存在原运行记录，临时新身份没有域名、Share、租约或挂售引用，公钥及已验证 Owner 有效且没有 fencing；恢复、身份别名和管理员审计同事务提交。请求不得携带私钥。普通 Owner 下架不需要该管理员入口。
+
 注册成功只建立 installation 控制身份,不会立即形成可见 Client。Server 还必须完成 owner 验证、启用同 owner 的 Client tunnel,并签名上报 setup 完成;Router 随后写入 `client_activated_at`。Dashboard、Metrics、Client 日志入口、Client chat、公开地图和 Share 清单只读取已经激活的 Client。在线状态只由 `/v1/installations/heartbeat` 更新,其他签名控制请求只更新一般活动时间。
 
 ### 2.2 Auth device
@@ -418,9 +422,9 @@ Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／install
 
 无论所选价格，`paidReady` 和 `paidBlocker` 均说明当前账号的收费资格。预检不会认领供应商身份。已验证邮箱的设备所有者首次收费时可调用 `POST /v1/client-market/online/installations/:id/verify-provider` 认领自己的供应商身份，成功返回 `{"paidReady":true}`，重复调用不会创建第二个身份。验证和正式上架分别提交。上架时 Router 重新核验设备和收费条件，已知阻塞通过 `CLIENT_LISTING_BLOCKED` 的 `details.reason` 返回。
 
-公开库存使用 `GET /v1/client-market/online/listings`。有登录态的卖家在 `POST /v1/client-market/online/installations/:id/listing` 提交 `cyclePriceMinor`（USD 分）、可选 `freeDays`、`trialDays` 和 `acknowledged`。同一路径的 DELETE 发起下架。返回 `locking` 或 `unlocking` 表示意图已记录，最终状态通过库存读取。出口探测以一次性 challenge 向 Router 回调，过期、复用和与上架项不匹配的回调均无效。
+公开库存使用 `GET /v1/client-market/online/listings`。有登录态的卖家在 `POST /v1/client-market/online/installations/:id/listing` 提交 `cyclePriceMinor`（USD 分）、可选 `freeDays`、`trialDays` 和 `acknowledged`。同一路径的 GET 仅限卖家读取 `state`、`hostSyncState`（`confirmed` / `pending` / `waiting_reconnect` / `after_rental`）、下架时间和真实命令发送次数；运行记录回收后仍可读取。DELETE 幂等完成市场下架并返回 `unlisted`，不依赖 Client 在线。已有租约继续履约和结算，本机解除挂售锁作为独立意图协调，不能覆盖租约控制命令。POST 返回 `locking` 表示上架意图已记录，最终状态通过库存读取。出口探测以一次性 challenge 向 Router 回调，过期、复用和与上架项不匹配的回调均无效。
 
-列表的 `state` 表示挂售生命周期，`availability` 表示设备能否交付。公开挂牌的设备返回 `available`、`occupied`、`offline`、`upgrading`、`switching`、`upgrade_required` 或 `unavailable`。卖家还能看到过渡中的 `locking`、`unlocking`，完成下架的设备从列表移除。未释放租约或待完成的退租结算记为占用。空闲设备只有在十分钟内确认隧道断开时才记为离线，升级与切换取自同一时限内的签名回执。可租还要求租赁能力、签名独占能力及有效的健康探测。自租能力 `ownerRental` 单列，只对本人下单生效。
+列表的 `state` 表示挂售生命周期，`availability` 表示设备能否交付。公开挂牌的设备返回 `available`、`occupied`、`offline`、`upgrading`、`switching`、`upgrade_required` 或 `unavailable`。卖家还能看到上架过渡 `locking`；旧 `unlocking` 迁移为 `unlisted` 并保留本机同步意图。已下架且无在租订单的设备从当前挂售列表移除；在租下架仍保留租约详情。未释放租约或待完成的退租结算记为占用。空闲设备只有在十分钟内确认隧道断开时才记为离线，升级与切换取自同一时限内的签名回执。可租还要求租赁能力、签名独占能力及有效的健康探测。自租能力 `ownerRental` 单列，只对本人下单生效。
 
 买家带上架项 `revision` 和 `autoRenew` 请求 `POST /v1/client-market/online/installations/:id/quote`，在 120 秒内用 `POST /v1/client-market/online/quotes/:id/commit` 确认告知。报价不占库存，提交时重新检查准入、库存、版本与钱包。付费报价冻结首期供应商佣金。报价后试用额度重置或剩余时长改变，首次提交返回 409，买家需重新报价。已成交的报价仅供原买家重放，返回原 `leaseId` 与当前状态。回执与工作区通知打开 `/account/rentals/?market=client&focus=<leaseId>`。
 
@@ -428,7 +432,7 @@ Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／install
 
 新租约的初始状态为 `starting`。工作区就绪后进入 `active`。租户通过 `GET /v1/client-market/online/leases` 读取域名、授权到期时间与访问记录。默认最多返回 200 条，当前租约优先。工作区启动页使用 `?current=true` 读取该买家的全部未释放租约。附带 `focus=<leaseId>` 时也返回该买家指定的已释放记录。窗口票据的目标是本次 `leaseId`，每次验证买家身份、域名版本、租约状态及有效期。租户的 Share 位于 `{slug}--{leaseAlias}`，由当前工作区账号持有。
 
-卖家可对 `locking` 或 `unlocking` 调用 `POST /v1/client-market/online/installations/:id/retry`，重新调度同一序号。
+卖家可对上架或尚未送达的本机同步意图调用 `POST /v1/client-market/online/installations/:id/retry`，重新调度同一序号。
 
 卖家登录后可通过 `GET /v1/client-market/online/seller-inventory` 查看当前上架项和自己售出的租约。`items` 包含 ID、名称、状态、成交月价、完整租户邮箱、授权到期时间和可选的 `terminationId`。`listingId` 指向该卖家仍可管理的物理上架项。买家租约投影还包含 `createdAt,activatedAt,cyclePriceMinor,country,autoRenew,periodEnd,holdStatus` 及访问事件的 `count`。开通成功的站内通知以租约为单位幂等投递。
 

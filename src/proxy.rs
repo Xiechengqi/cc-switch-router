@@ -1797,6 +1797,17 @@ impl ProxyRegistry {
             .cloned()
     }
 
+    pub(crate) async fn active_client_installation_ids(&self) -> Vec<String> {
+        self.routes
+            .read()
+            .await
+            .values()
+            .filter_map(|slot| slot.active.as_ref())
+            .filter(|route| route.is_client_web())
+            .filter_map(|route| route.installation_id.clone())
+            .collect()
+    }
+
     async fn route_for_share_request(
         &self,
         share_id: &str,
@@ -7779,7 +7790,7 @@ async fn resolve_client_web_bearer(
         return Ok(None);
     };
     if let Some(installation_id) = installation_id
-        && crate::online_client_market::listed(state, installation_id).await?
+        && crate::online_client_market::management_protected(state, installation_id).await?
     {
         // Market Clients are separate trust domains. Their bearer token must
         // pass through to cc-switch-server for local password/owner OTP auth;

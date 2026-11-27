@@ -21,6 +21,7 @@ import {
   onlineRequest,
   setOnlineListingPaused,
   type OnlineListing,
+  type OnlineListingSyncStatus,
   type OnlineSellerItem,
 } from "@/lib/online-client-market";
 import { ClientListingAddDialog } from "./client-listing-add-dialog";
@@ -33,7 +34,7 @@ import { formatWalletUnits } from "@/lib/market-wallet-money";
 function probeKey(code: string): MessageKey {
   switch (code) {
     case "tunnel_offline":
-      return "online.offline";
+      return "online.routerDisconnected";
     case "upgrading":
       return "online.upgrading";
     case "switching":
@@ -49,6 +50,27 @@ function probeKey(code: string): MessageKey {
 
 const sellerItemRented = (item: OnlineSellerItem) =>
   item.state !== "released" && (item.startedAt != null || !!item.tenantEmail);
+
+function ListingSyncDetail({ installationId, revision }: { installationId: string; revision?: number }) {
+  const { t } = useLocaleText();
+  const [status, setStatus] = React.useState<OnlineListingSyncStatus | null>(null);
+  React.useEffect(() => {
+    const abort = new AbortController();
+    const load = async () => {
+      try {
+        const next = await onlineRequest<OnlineListingSyncStatus>(`installations/${encodeURIComponent(installationId)}/listing`, "GET", undefined, abort.signal);
+        if (!abort.signal.aborted) setStatus(next);
+      } catch {
+        if (!abort.signal.aborted) setStatus(null);
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 20_000);
+    return () => { abort.abort(); clearInterval(timer); };
+  }, [installationId, revision]);
+  if (!status || status.state !== "unlisted" || status.hostSyncState === "confirmed") return null;
+  return <p role="status" className="text-xs text-muted-foreground">{t(status.hostSyncState === "after_rental" ? "online.hostSyncAfterRental" : status.hostSyncState === "waiting_reconnect" ? "online.hostSyncWaiting" : "online.hostSyncPending")}</p>;
+}
 
 export function SellerWorkspace({
   listings,
@@ -115,14 +137,14 @@ export function SellerWorkspace({
   const income = (item: OnlineSellerItem) =>
     item.incomeUnits != null ? formatWalletUnits(item.incomeUnits, "$", locale) : item.cyclePriceMinor ? "—" : formatUsdMoney(0, locale);
   const editButton = (listing: OnlineListing | undefined) =>
-    listing ? (
+    listing?.state === "listed" ? (
       <Button size="sm" variant="outline" className="min-h-11" isDisabled={busy} onPress={() => setEditing(listing)}>
         <PencilLine className="size-3.5" aria-hidden />
         {t("clientMarket.edit.action")}
       </Button>
     ) : null;
   const pauseButton = (item: OnlineSellerItem, listing: OnlineListing | undefined) =>
-    listing && item.listingId ? (
+    listing?.state === "listed" && item.listingId ? (
       <Button
         size="sm"
         variant="outline"
@@ -207,10 +229,10 @@ export function SellerWorkspace({
                 detail={item.title ? <span className="font-mono">{item.label}</span> : null}
                 listing={listing}
                 actions={
-                  item.listingId && !transitional ? (
+                  item.listingId ? (
                     <>
-                      {editButton(listing)}
-                      {pauseButton(item, listing)}
+                      {!transitional ? editButton(listing) : null}
+                      {!transitional ? pauseButton(item, listing) : null}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -325,6 +347,11 @@ export function SellerWorkspace({
                         </Button>
                       ) : null}
                       {editButton(listing)}
+                      {listing && listing.state !== "unlisted" ? (
+                        <Button size="sm" variant="ghost" className="min-h-11" isDisabled={busy} onPress={() => setUnlisting(listing)}>
+                          {t("online.unlist")}
+                        </Button>
+                      ) : null}
                       {item.terminationId ? (
                         <Button size="sm" variant="ghost" className="min-h-11" onPress={() => onTerminationOpen(item.terminationId!)}>
                           {t("online.exitRecord")}
@@ -333,10 +360,13 @@ export function SellerWorkspace({
                     </>
                   }
                   extra={
-                    <ClientTerminationHostAction
-                      summary={item.listingId ? terminations.get(item.listingId) : undefined}
-                      onOpen={onTerminationOpen}
-                    />
+                    <div className="grid gap-2">
+                      {listing?.state === "unlisted" && item.listingId ? <ListingSyncDetail installationId={item.listingId} revision={listing.revision} /> : null}
+                      <ClientTerminationHostAction
+                        summary={item.listingId ? terminations.get(item.listingId) : undefined}
+                        onOpen={onTerminationOpen}
+                      />
+                    </div>
                   }
                 />
               );
@@ -370,6 +400,7 @@ export function SellerWorkspace({
                     { label: t("clientMarket.seller.income"), value: income(row) },
                   ]}
                 />
+                {row.listingId ? <ListingSyncDetail installationId={row.listingId} revision={listingById.get(row.listingId)?.revision} /> : null}
                 {row.terminationId ? (
                   <Button size="sm" variant="outline" className="justify-self-start" onPress={() => onTerminationOpen(row.terminationId!)}>
                     {t("online.exitRecord")}
@@ -405,6 +436,7 @@ export function SellerWorkspace({
                   void action(async () => {
                     if (!unlisting) return;
                     await onlineRequest(`installations/${encodeURIComponent(unlisting.installationId)}/listing`, "DELETE");
+                    toast.success(t("online.unlisted"));
                     setUnlisting(null);
                   })
                 }
