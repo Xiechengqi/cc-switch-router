@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Drawer, toast } from "@heroui/react";
-import { ArrowRightLeft, ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, Terminal, X } from "lucide-react";
+import { ChevronDown, Copy, ListFilter, MessageCircle, Plus, ScrollText, Search, X } from "lucide-react";
 import * as React from "react";
 import Link from "next/link";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
@@ -9,9 +9,8 @@ import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatma
 import { ShareModelHealthHeatmap } from "@/components/dashboard/share-model-health-heatmap";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientShareRecoveryCards, useClientShareRecoveryCount } from "./client-share-market";
-import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
+import { ClientOpsMenu } from "@/components/dashboard/client-ops-menu";
 import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, shareIsEnabled, shareOperationalSummary, summarizeShareAvailability, useStableOperationalRanks } from "@/components/dashboard/operational-status";
-import { useClientConsole } from "@/components/dashboard/client-console";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
@@ -42,7 +41,6 @@ import type { DashboardClient, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime, preferredScrollBehavior } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { CompactSelect } from "@/components/common/compact-select";
-import { clientWebTerminalUrl } from "@/lib/client-web-view";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -130,18 +128,6 @@ function shouldToggleClientHeader(
   return true;
 }
 
-function ClientConsoleIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className={className}>
-      <rect x="1.5" y="2.5" width="13" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.25" />
-      <path d="M5.5 12.5h5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      <path d="M8 12.5V14" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      <path d="M4.5 6.25h7" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      <path d="M4.5 8.75h4.5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 function ClientHeaderInlineButton({
   label,
   onClick,
@@ -169,56 +155,6 @@ function ClientHeaderInlineButton({
   );
 }
 
-function ClientConsoleButton({ client }: { client: DashboardClient }) {
-  const { t } = useLocaleText();
-  const { openConsole } = useClientConsole();
-  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  if (!tunnelUrl) return null;
-  const title = client.clientTunnel?.subdomain || tunnelUrl;
-  return (
-    <ClientHeaderInlineButton
-      label={t("dashboard.clientConsole")}
-      onClick={() =>
-        openConsole({
-          clientId: client.rental?.controlId || client.installation.id,
-          kind: "console",
-          url: tunnelUrl,
-          title,
-        })
-      }
-      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 text-[11px] font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-    >
-      <ClientConsoleIcon className="h-3 w-3 shrink-0" />
-      <span>{t("dashboard.clientConsole")}</span>
-    </ClientHeaderInlineButton>
-  );
-}
-
-function ClientTerminalButton({ client }: { client: DashboardClient }) {
-  const { t } = useLocaleText();
-  const { openConsole } = useClientConsole();
-  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  if (!tunnelUrl || client.canOpenClientTerminal !== true) return null;
-  const title = client.clientTunnel?.subdomain || tunnelUrl;
-  return (
-    <ClientHeaderInlineButton
-      label={t("dashboard.clientTerminal")}
-      onClick={() =>
-        openConsole({
-          clientId: client.installation.id,
-          kind: "terminal",
-          url: clientWebTerminalUrl(tunnelUrl),
-          title: t("dashboard.clientTerminalTitle", { target: title }),
-        })
-      }
-      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-medium text-emerald-700 transition-colors hover:border-emerald-300 hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-    >
-      <Terminal className="h-3 w-3 shrink-0" />
-      <span>{t("dashboard.clientTerminal")}</span>
-    </ClientHeaderInlineButton>
-  );
-}
-
 function ClientDetailsButton({ onOpen }: { onOpen: () => void }) {
   const { t } = useLocaleText();
   return (
@@ -242,20 +178,6 @@ function ClientLogsButton({ onOpen }: { onOpen: () => void }) {
     >
       <ScrollText className="h-3 w-3" aria-hidden />
       <span>{t("clientLogs.button")}</span>
-    </ClientHeaderInlineButton>
-  );
-}
-
-function ClientTakeoverButton({ onOpen }: { onOpen: () => void }) {
-  const { t } = useLocaleText();
-  return (
-    <ClientHeaderInlineButton
-      label={t("dashboard.subdomainTakeover.action")}
-      onClick={onOpen}
-      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-medium text-amber-800 transition-colors hover:border-amber-300 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-    >
-      <ArrowRightLeft className="h-3 w-3" aria-hidden />
-      <span>{t("dashboard.subdomainTakeover.action")}</span>
     </ClientHeaderInlineButton>
   );
 }
@@ -418,7 +340,6 @@ function ClientCard({
   onOpenLogs?: () => void;
 }) {
   const { locale, t } = useLocaleText();
-  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   const owner = clientOwnerEmail(client);
   const {session}=useAuth();
   const allShares = summaryShares || shares;
@@ -445,6 +366,18 @@ function ClientCard({
   const clientIp = client.installation.publicIp?.trim();
   const identity = hasSubdomain ? subdomain : client.installation.id;
   const versionLabel = clientPlatformLabel(client);
+  const rental = client.rental;
+  const peopleLabel = [
+    owner && owner !== "-" ? `${t("dashboard.owner")} ${owner}` : "",
+    rental ? `${t("dashboard.renter")} ${rental.tenantEmail || t("clientMarket.shop.rentedOut")}` : "",
+    rental?.selfRental ? t("dashboard.selfRental") : "",
+    rental
+      ? t(rental.state === "active" ? "dashboard.rentalActive" : rental.state === "starting" ? "dashboard.rentalStarting" : "dashboard.rentalReturning")
+      : "",
+    rental?.migrationRequired ? t("dashboard.rentalMigration") : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const showRemoval = state === "offline" && !!client.removalAt && !client.installation.marketListed;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
@@ -516,24 +449,19 @@ function ClientCard({
               {showRemoval ? (
                 <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" />
               ) : null}
-            </div>
-            <div className="grid min-w-0 gap-0.5 pl-4 text-xs text-muted-foreground">
-              {owner && owner !== "-" && <span className="break-all">{t("dashboard.owner")} {owner}</span>}
-              {client.rental && (
-                <span className="break-all">{t("dashboard.renter")} {client.rental.tenantEmail || t("clientMarket.shop.rentedOut")}
-                  {client.rental.selfRental && ` · ${t("dashboard.selfRental")}`} · {t(client.rental.state === "active"
-                    ? "dashboard.rentalActive" : client.rental.state === "starting" ? "dashboard.rentalStarting" : "dashboard.rentalReturning")}
-                  {client.rental.migrationRequired && ` · ${t("dashboard.rentalMigration")}`}
+              {/* Owner and renter share the name row to keep the card short. The
+                  span takes only the space left over (basis 0), so it truncates
+                  before the name or the status reason; the title has it in full. */}
+              {peopleLabel ? (
+                <span className="min-w-0 flex-1 basis-0 truncate text-xs text-muted-foreground" title={peopleLabel}>
+                  {peopleLabel}
                 </span>
-              )}
+              ) : null}
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
-              {tunnelUrl && (!client.rental || client.rental.controlId) ? <ClientConsoleButton client={client} /> : null}
-              {tunnelUrl && client.canOpenClientTerminal === true ? (
-                <ClientTerminalButton client={client} />
-              ) : null}
-              <ClientUpgradeButton key={client.rental?.controlId || client.installation.id} client={client} />
-              {!client.rental && onOpenTakeover ? <ClientTakeoverButton onOpen={onOpenTakeover} /> : null}
+              {/* Console, terminal, upgrade and subdomain switch: only for the
+                  owner (not while rented out) and the tenant. Logs and chat stay public. */}
+              <ClientOpsMenu key={client.rental?.controlId || client.installation.id} client={client} onOpenTakeover={onOpenTakeover} />
               {client.logCollectionEnabled && onOpenLogs ? <ClientLogsButton onOpen={onOpenLogs} /> : null}
               <ClientChatButton client={client} />
               {session?.authenticated &&

@@ -212,6 +212,9 @@ export type DashboardClient = {
   canUpgrade?: boolean;
   chatAvailable?: boolean;
   logCollectionEnabled?: boolean;
+  /** The owner while not rented, the tenant while rented. */
+  canOpenClientConsole?: boolean;
+  /** The owner only, and only while not rented. */
   canOpenClientTerminal?: boolean;
   installation: {
     /** The Client supports online leasing (`/_ctl/market/*`). */

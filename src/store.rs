@@ -13358,8 +13358,13 @@ impl AppStore {
                             .get(&installation.id)
                             .copied()
                             .unwrap_or(false),
-                    can_open_client_terminal: rental.is_none()
-                        && (!installation.market_listed || owner),
+                    // Client operations (console, terminal, upgrade, subdomain
+                    // switch) are for the owner and the tenant only; the board
+                    // shows nobody else an "Ops" entry.
+                    can_open_client_console: rental
+                        .as_ref()
+                        .map_or(owner, |r| r.control_id.is_some()),
+                    can_open_client_terminal: rental.is_none() && owner,
                     rental,
                     share_count,
                     share_ids,
@@ -53964,6 +53969,7 @@ pub(crate) mod tests {
             Some("203.0.113.xx")
         );
         assert!(client.can_open_client_terminal);
+        assert!(client.can_open_client_console);
         let revealed = store
             .dashboard_snapshot(
                 &config,
@@ -53982,7 +53988,9 @@ pub(crate) mod tests {
             owner_client.installation.public_ip.as_deref(),
             Some("203.0.113.10")
         );
+        // The Router owner is not this Client's owner: no Client operations.
         assert!(!owner_client.can_open_client_terminal);
+        assert!(!owner_client.can_open_client_console);
         let _ = std::fs::remove_file(&config.database.path);
     }
 
@@ -54019,7 +54027,9 @@ pub(crate) mod tests {
         assert_eq!(snapshot.stats.active_shares, 0);
         assert_eq!(snapshot.stats.total_active_requests, 0);
         assert_eq!(snapshot.clients.len(), 1);
-        assert!(snapshot.clients[0].can_open_client_terminal);
+        // An anonymous viewer gets no Client operations, listed or not.
+        assert!(!snapshot.clients[0].can_open_client_terminal);
+        assert!(!snapshot.clients[0].can_open_client_console);
         assert_eq!(
             snapshot.shares.first().expect("share view").share_status,
             "paused"

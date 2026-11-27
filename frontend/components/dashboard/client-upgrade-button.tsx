@@ -75,7 +75,7 @@ function writeStoredState(installationId: string, state: ClientUpgradeState) {
   }));
 }
 
-function UpgradeStateIcon({ state }: { state: ClientUpgradeState }) {
+export function UpgradeStateIcon({ state }: { state: ClientUpgradeState }) {
   if (state.statusUnavailable || state.phase === "recovering") {
     return <Clock3 className="h-3 w-3 shrink-0" />;
   }
@@ -86,23 +86,36 @@ function UpgradeStateIcon({ state }: { state: ClientUpgradeState }) {
   return <Rocket className="h-3 w-3 shrink-0" />;
 }
 
-export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
+/** The upgrade inputs for a board card: the tenant upgrades through the lease's control id. */
+export function clientUpgradeInput(client: DashboardClient): ClientUpgradeInput {
   const leased = !!client.rental;
   const installationId = client.rental?.controlId || client.installation.id;
   const tunnel = client.clientTunnel;
   const upgrade = client.installation.upgrade;
-  return <ClientUpgradeControl installationId={installationId} leased={leased}
-    upgradeTarget={tunnel?.subdomain || installationId.slice(0, 8)} canInspect={client.canUpgrade === true}
-    available={!!clientTunnelDisplayUrl(tunnel?.tunnelUrl) && tunnel?.enabled === true && tunnel.online
-      && (leased || upgrade?.delegateUpgradeToRouterOwner !== false) && upgrade?.upgradeCapable !== false}
-    tunnelOnline={tunnel?.online === true} observedCommitId={upgrade?.commitId?.trim() || undefined}
-  />;
+  return {
+    installationId,
+    leased,
+    upgradeTarget: tunnel?.subdomain || installationId.slice(0, 8),
+    canInspect: client.canUpgrade === true,
+    available: !!clientTunnelDisplayUrl(tunnel?.tunnelUrl) && tunnel?.enabled === true && tunnel.online
+      && (leased || upgrade?.delegateUpgradeToRouterOwner !== false) && upgrade?.upgradeCapable !== false,
+    tunnelOnline: tunnel?.online === true,
+    observedCommitId: upgrade?.commitId?.trim() || undefined,
+  };
 }
 
-export function ClientUpgradeControl({ installationId, leased, upgradeTarget, canInspect, available, tunnelOnline, observedCommitId }: {
+export type ClientUpgradeInput = {
   installationId: string; leased: boolean; upgradeTarget: string; canInspect: boolean;
   available: boolean; tunnelOnline?: boolean; observedCommitId?: string;
-}) {
+};
+
+/**
+ * Upgrade state, status polling and the confirm dialog for one Client. It lives
+ * in a component that stays mounted (the card's "Ops" menu, or
+ * `ClientUpgradeControl`), so an upgrade keeps being tracked, and its dialog
+ * stays open, while the menu that started it is closed.
+ */
+export function useClientUpgrade({ installationId, leased, upgradeTarget, canInspect, available, tunnelOnline, observedCommitId }: ClientUpgradeInput) {
   const { t } = useLocaleText();
   const [state, setState] = React.useState<ClientUpgradeState>(IDLE_CLIENT_UPGRADE_STATE);
   const [stateReady, setStateReady] = React.useState(false);
@@ -333,7 +346,8 @@ export function ClientUpgradeControl({ installationId, leased, upgradeTarget, ca
     upgradeTarget,
   ]);
 
-  if (!canInspect || (!canUpgrade && !leased && state.phase === "idle")) return null;
+  // Hidden while there is nothing to do; a tenant still sees why it is unavailable.
+  const visible = canInspect && (canUpgrade || leased || state.phase !== "idle");
 
   let buttonLabel = t("dashboard.clientUpgrade");
   if (state.phase === "starting" || state.phase === "running") {
@@ -422,41 +436,70 @@ export function ClientUpgradeControl({ installationId, leased, upgradeTarget, ca
 
   const buttonDisabled = !stateReady || locked || confirmOpen || !canUpgrade || !!state.retryBlocked;
 
+  /** Something worth surfacing on a closed menu: an upgrade under way, failed or unconfirmed. */
+  const attention = state.phase === "starting" || state.phase === "running" || state.phase === "failed"
+    || (state.phase === "recovering" && state.recoveryReason === "start") || !!state.statusUnavailable;
+
+  const dialog = (
+    <ConfirmAlertDialog
+      open={confirmOpen}
+      title={t("dashboard.clientUpgradeConfirmTitle")}
+      description={t(state.statusUnavailable
+        ? "dashboard.clientUpgradeStatusRetryConfirm"
+        : "dashboard.clientUpgradeConfirm", { target: upgradeTarget })}
+      confirmLabel={t("common.upgrade")}
+      cancelLabel={t("common.cancel")}
+      tone="warning"
+      busy={state.phase === "starting"}
+      confirmDisabled={!stateReady || locked || !canUpgrade}
+      onConfirm={beginUpgrade}
+      onOpenChange={(open) => {
+        if (state.phase !== "starting") setConfirmOpen(open);
+      }}
+    />
+  );
+
+  return {
+    visible,
+    state,
+    attention,
+    label: buttonLabel,
+    ariaLabel: buttonAriaLabel,
+    tone: buttonTone,
+    locked,
+    disabled: buttonDisabled,
+    errorMessage: state.errorMessage,
+    /** Opens the confirm dialog; the upgrade starts from there. */
+    request: () => {
+      if (!buttonDisabled) setConfirmOpen(true);
+    },
+    dialog,
+  };
+}
+
+/** A standalone upgrade pill (the tenant's lease actions in the Client market). */
+export function ClientUpgradeControl(props: ClientUpgradeInput) {
+  const upgrade = useClientUpgrade(props);
+  if (!upgrade.visible) return null;
   return (
     <>
       <button
         type="button"
         data-no-row-drawer
-        aria-label={buttonAriaLabel}
-        aria-busy={locked || undefined}
-        title={state.errorMessage}
-        disabled={buttonDisabled}
+        aria-label={upgrade.ariaLabel}
+        aria-busy={upgrade.locked || undefined}
+        title={upgrade.errorMessage}
+        disabled={upgrade.disabled}
         onClick={(event) => {
           event.stopPropagation();
-          if (buttonDisabled) return;
-          setConfirmOpen(true);
+          upgrade.request();
         }}
-        className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-65 ${buttonTone}`}
+        className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-65 ${upgrade.tone}`}
       >
-        <UpgradeStateIcon state={state} />
-        <span>{buttonLabel}</span>
+        <UpgradeStateIcon state={upgrade.state} />
+        <span>{upgrade.label}</span>
       </button>
-      <ConfirmAlertDialog
-        open={confirmOpen}
-        title={t("dashboard.clientUpgradeConfirmTitle")}
-        description={t(state.statusUnavailable
-          ? "dashboard.clientUpgradeStatusRetryConfirm"
-          : "dashboard.clientUpgradeConfirm", { target: upgradeTarget })}
-        confirmLabel={t("common.upgrade")}
-        cancelLabel={t("common.cancel")}
-        tone="warning"
-        busy={state.phase === "starting"}
-        confirmDisabled={!stateReady || locked || !canUpgrade}
-        onConfirm={beginUpgrade}
-        onOpenChange={(open) => {
-          if (state.phase !== "starting") setConfirmOpen(open);
-        }}
-      />
+      {upgrade.dialog}
     </>
   );
 }

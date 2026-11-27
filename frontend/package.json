@@ -28,7 +28,7 @@
     "test:model-routing": "tsx --test lib/model-routing.test.ts lib/model-routing-session.test.ts lib/model-routing-test-session.test.ts lib/model-routing-commands.test.ts lib/model-routing-traffic.test.ts components/dashboard/model-hub-share-summary.test.tsx components/dashboard/model-hub-traffic.test.tsx",
     "test:model-price-effectivity": "tsx --test lib/model-price-effectivity.test.ts",
     "test:share-model-health-heatmap": "tsx --test lib/share-health.test.ts components/dashboard/share-model-health-heatmap.test.ts components/dashboard/client-online-heatmap.test.ts",
-    "test:client-upgrade-state": "tsx --test components/dashboard/client-upgrade-state.test.ts",
+    "test:client-upgrade-state": "tsx --test components/dashboard/client-upgrade-state.test.ts components/dashboard/client-ops.test.ts",
     "test:client-market": "tsx --test components/dashboard/client-market/host-utils.test.ts components/dashboard/client-market/online-shop.test.tsx components/dashboard/client-market/client-next-trial-notice.test.tsx lib/client-checkout.test.ts lib/client-termination.test.ts lib/client-rental-audit.test.ts lib/client-rentals.test.ts lib/client-seller-summary.test.ts lib/share-rental-audit.test.ts",
     "test:providers": "tsx --test components/dashboard/providers-page-utils.test.ts lib/dashboard-nav.test.ts lib/home-entry.test.ts lib/url-search.test.ts lib/account-market-records.test.ts lib/account-market-contract.test.ts",
     "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check",

@@ -4168,6 +4168,12 @@ pub struct DashboardClientView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rental: Option<DashboardClientRental>,
     pub can_upgrade: bool,
+    /// The viewer may open the Client console: its owner while it is not
+    /// rented, its tenant (who holds the lease's control id) while it is.
+    #[serde(default)]
+    pub can_open_client_console: bool,
+    /// Only the owner, and only while the Client is not rented. A tenant never
+    /// gets the shell on the seller's machine.
     #[serde(default)]
     pub can_open_client_terminal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
