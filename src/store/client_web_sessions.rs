@@ -107,6 +107,26 @@ impl AppStore {
         c.query_row("SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL)",params![id],|r|r.get(0))
             .map_err(|e|AppError::Internal(format!("read Client rental: {e}")))
     }
+    /// Whether the viewer is the Client's active tenant, on the same terms that
+    /// open the tenant's console: an active lease within its grant, under
+    /// exclusive management.
+    pub(crate) async fn is_installation_tenant(
+        &self,
+        id: &str,
+        viewer_id: &str,
+    ) -> Result<bool, AppError> {
+        let c = self.conn.lock().await;
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM online_client_leases r
+                 LEFT JOIN online_client_listings l USING(installation_id)
+              WHERE r.installation_id=?1 AND r.released_at IS NULL AND r.buyer_id=?2
+                AND r.state='active' AND r.grant_until>unixepoch()
+                AND (r.management_version<2 OR coalesce(l.exclusive_management,0)))",
+            params![id, viewer_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| AppError::Internal(format!("read Client rental: {e}")))
+    }
     async fn client_window_target(
         &self,
         installation_id: &str,
@@ -732,6 +752,23 @@ mod tests {
             )
             .unwrap();
         assert!(store.validate_window(&grant).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_the_active_tenant_counts_as_tenant() {
+        let (store, _, _) = fixture().await;
+        assert!(!store.is_installation_tenant("installation", "buyer").await.unwrap());
+        {
+            let c = store.conn.lock().await;
+            c.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,updated_at) VALUES('installation','owner','owner@example.test','listed',1,1,0,0)",[]).unwrap();
+            crate::test_support::online_lease(&c, "rental", "installation", "owner", "buyer", "2026-11-26T00:00:00Z");
+            c.execute("UPDATE online_client_leases SET released_at=NULL WHERE id='rental'", []).unwrap();
+        }
+        assert!(store.is_installation_tenant("installation", "buyer").await.unwrap());
+        assert!(!store.is_installation_tenant("installation", "owner").await.unwrap());
+        // A lease still starting does not make the buyer the tenant yet.
+        store.conn.lock().await.execute("UPDATE online_client_leases SET state='starting' WHERE id='rental'", []).unwrap();
+        assert!(!store.is_installation_tenant("installation", "buyer").await.unwrap());
     }
 
     #[tokio::test]

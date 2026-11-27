@@ -351,11 +351,11 @@ export function ShareMarketWorkspace() {
   }, [hasOwnedShares, visibleOwnedShareCount, workspace]);
 
   const workspaceItems = [
-    { id: "catalog" as const, label: t("shareMarket.workspace.catalog") },
+    { id: "catalog" as const, label: t("market.tab.catalog") },
     ...(showSellingTab
-      ? [{ id: "selling" as const, label: t("shareMarket.workspace.selling") }]
+      ? [{ id: "selling" as const, label: t("market.tab.selling") }]
       : []),
-    ...(showAuditTab ? [{ id: "audit" as const, label: t("rentalAudit.tab") }] : []),
+    ...(showAuditTab ? [{ id: "audit" as const, label: t("market.tab.audit") }] : []),
   ];
   const workspaceValue = (workspace === "selling" && !showSellingTab) || (workspace === "audit" && !showAuditTab) ? "catalog" : workspace;
 

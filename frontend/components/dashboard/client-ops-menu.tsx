@@ -25,7 +25,7 @@ const HOVER_OPEN_DELAY_MS = 120;
 // Long enough to cross the gap between the trigger and the menu.
 const HOVER_CLOSE_DELAY_MS = 200;
 
-function ClientConsoleIcon({ className }: { className?: string }) {
+export function ClientConsoleIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className={className}>
       <rect x="1.5" y="2.5" width="13" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.25" />

@@ -148,12 +148,18 @@ async fn client_logs_inner(
         }
         None => false,
     };
-    if state.store.installation_leased(installation_id).await? {
-        return Err(AppError::Forbidden(
-            "installation logs are unavailable during rental".into(),
-        ));
-    }
-    let line_limit = client_log_line_limit(is_client_owner);
+    // Logs are public, rented or not. Whoever manages the Client (its owner,
+    // or its tenant while rented) reads the full tail.
+    let is_client_tenant = match session.as_ref() {
+        Some(session) => {
+            state
+                .store
+                .is_installation_tenant(installation_id, &session.user_id)
+                .await?
+        }
+        None => false,
+    };
+    let line_limit = client_log_line_limit(is_client_owner || is_client_tenant);
     if !state
         .store
         .client_log_installation_exists(installation_id)
@@ -180,16 +186,12 @@ async fn client_logs_inner(
     )
     .await
     .map_err(map_control_error)?;
-    if state.store.installation_leased(installation_id).await? {
-        return Err(AppError::Forbidden(
-            "installation logs are unavailable during rental".into(),
-        ));
-    }
     client_logs_response(installation_id, line_limit, reply)
 }
 
-fn client_log_line_limit(is_client_owner: bool) -> usize {
-    if is_client_owner {
+/// The full tail for whoever manages the Client, a short one for everyone else.
+fn client_log_line_limit(is_client_manager: bool) -> usize {
+    if is_client_manager {
         OWNER_LOG_LINE_LIMIT
     } else {
         PUBLIC_LOG_LINE_LIMIT

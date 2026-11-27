@@ -13353,11 +13353,11 @@ impl AppStore {
                 let mut view = DashboardClientView {
                     can_upgrade,
                     chat_available: installation.owner_email.is_some(),
-                    log_collection_enabled: rental.is_none()
-                        && log_collection_by_installation
-                            .get(&installation.id)
-                            .copied()
-                            .unwrap_or(false),
+                    // Logs stay public while the Client is rented.
+                    log_collection_enabled: log_collection_by_installation
+                        .get(&installation.id)
+                        .copied()
+                        .unwrap_or(false),
                     // Client operations (console, terminal, upgrade, subdomain
                     // switch) are for the owner and the tenant only; the board
                     // shows nobody else an "Ops" entry.

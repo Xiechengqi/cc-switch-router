@@ -2,12 +2,11 @@
 /*
  * The Client market page body. It reads the listings (and, for sellers, the
  * seller inventory) and composes the pieces:
- *   - MyClientRentals: the buyer's running rentals, on top;
  *   - ShopCatalog + useClientCheckout: browse and rent. Its "Mine" tab swaps
- *     the shop for the buyer's rentals and their rental history;
+ *     the shop for the buyer's rentals (MyClientRentals) and their history;
  *   - SellerWorkspace: listed, rented out and past rentals;
  *   - ClientRentalAuditPanel: the Router owner's audit of every rental.
- * After an order the buyer stays here and the new rental card is highlighted.
+ * After an order the buyer lands on "Mine", with the new rental highlighted.
  *
  * Tabs follow the Share market: "My listings" appears only for users who sell
  * (the server's seller summary says so), "Rental audit" only for the Router
@@ -189,6 +188,8 @@ function OnlineMarketView({
 
   function showReceipt(id: string) {
     setNewLease(id);
+    // Rentals live only under "Mine": show the new one there.
+    setMineSelected(true);
     setRentalRevision((value) => value + 1);
     reload();
     toast.success(t("clientMarket.mine.ordered"));
@@ -218,9 +219,9 @@ function OnlineMarketView({
   }, [view, workspace, selectWorkspace]);
 
   const workspaceItems: Array<{ id: ClientMarketWorkspace; label: string }> = [
-    { id: "catalog", label: t("clientMarket.shop.catalog") },
-    ...(showSelling ? [{ id: "selling" as const, label: t("clientMarket.shop.selling") }] : []),
-    ...(canAudit ? [{ id: "audit" as const, label: t("rentalAudit.tab") }] : []),
+    { id: "catalog", label: t("market.tab.catalog") },
+    ...(showSelling ? [{ id: "selling" as const, label: t("market.tab.selling") }] : []),
+    ...(canAudit ? [{ id: "audit" as const, label: t("market.tab.audit") }] : []),
   ];
 
   return (
@@ -274,40 +275,36 @@ function OnlineMarketView({
           onTerminationOpen={onTerminationOpen}
         />
       ) : (
-        <>
-          {authenticated && !mine ? (
-            <MyClientRentals revision={rentalRevision} highlightId={newLease} onTerminationOpen={onTerminationOpen} />
-          ) : null}
-          <ShopCatalog
-            listings={list}
-            loaded={loaded}
-            authenticated={authenticated}
-            busy={checkout.busy}
-            onRent={checkout.open}
-            terminations={terminations}
-            onTerminationOpen={onTerminationOpen}
-            providerNotice={providerNotice}
-            mine={{
-              selected: mine,
-              enabled: mineEnabled,
-              count: rentalCounts?.current ?? 0,
-              onChange: setMineSelected,
-              view: (
-                <div className="grid min-w-0 gap-5">
-                  {rentalCounts?.current === 0 ? (
-                    <p className="rounded-md border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500">
-                      {t("clientMarket.mine.none")}
-                    </p>
-                  ) : (
-                    <MyClientRentals revision={rentalRevision} highlightId={newLease} onTerminationOpen={onTerminationOpen} />
-                  )}
-                  {/* Rental history shows only under "Mine", like the Share catalog. */}
-                  <ClientRentalRecords historyOnly revision={rentalRevision} onTerminationOpen={onTerminationOpen} />
-                </div>
-              ),
-            }}
-          />
-        </>
+        <ShopCatalog
+          listings={list}
+          loaded={loaded}
+          authenticated={authenticated}
+          busy={checkout.busy}
+          onRent={checkout.open}
+          terminations={terminations}
+          onTerminationOpen={onTerminationOpen}
+          providerNotice={providerNotice}
+          mine={{
+            selected: mine,
+            enabled: mineEnabled,
+            count: rentalCounts?.current ?? 0,
+            onChange: setMineSelected,
+            view: (
+              <div className="grid min-w-0 gap-5">
+                {/* Counts trail a fresh order by one read; the new card wins. */}
+                {rentalCounts?.current === 0 && !newLease ? (
+                  <p className="rounded-md border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500">
+                    {t("clientMarket.mine.none")}
+                  </p>
+                ) : (
+                  <MyClientRentals revision={rentalRevision} highlightId={newLease} onTerminationOpen={onTerminationOpen} />
+                )}
+                {/* Rental history shows only under "Mine", like the Share catalog. */}
+                <ClientRentalRecords historyOnly revision={rentalRevision} onTerminationOpen={onTerminationOpen} />
+              </div>
+            ),
+          }}
+        />
       )}
       {checkout.dialog}
     </section>

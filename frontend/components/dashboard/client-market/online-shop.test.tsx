@@ -82,7 +82,23 @@ test("Client catalog: a Mine tab left of All shows the buyer's rentals and their
   // Rental history appears only under Mine.
   assert.match(market, /mine=\{\{[\s\S]*?<ClientRentalRecords historyOnly/);
   assert.equal(market.match(/<ClientRentalRecords/g)?.length, 1);
-  assert.match(market, /\{authenticated && !mine \? \(\s*<MyClientRentals/);
+  // Running rentals show only under Mine too; an order switches to it.
+  assert.equal(market.match(/<MyClientRentals/g)?.length, 1);
+  assert.match(market, /mine=\{\{[\s\S]*?<MyClientRentals/);
+  assert.match(market, /setNewLease\(id\);[\s\S]*?setMineSelected\(true\);/);
+});
+
+test("the tenant's rental card follows the Share card and opens the console in the dashboard window", () => {
+  const rentals = readFileSync(new URL("./my-rentals.tsx", import.meta.url), "utf8");
+  const actions = readFileSync(new URL("./lease-actions.tsx", import.meta.url), "utf8");
+  assert.match(rentals, /className=\{MARKET_SHARE_CARD_GRID_CLASS\}/);
+  assert.match(rentals, /"grid min-w-0 scroll-mt-20 content-start gap-2\.5 rounded-xl border bg-white p-3 shadow-sm outline-none"/);
+  assert.match(rentals, /openConsole\(\{ clientId: lease\.leaseId, kind: "console", url: lease\.clientUrl/);
+  assert.match(rentals, /t\("dashboard\.clientConsole"\)/);
+  // No new tab, setup checklist, IP-checker hint or details link.
+  assert.doesNotMatch(rentals, /target="_blank"|Onboarding|clientMarket\.onboarding|ipHint|clientMarket\.mine\.details|clientMarketTenantHref/);
+  // Workspace backups are gone from every rental action.
+  assert.doesNotMatch(actions, /backup|lease\.downloaded/);
 });
 
 test("every rental history block uses the shared Share-style section titled 租用历史", () => {

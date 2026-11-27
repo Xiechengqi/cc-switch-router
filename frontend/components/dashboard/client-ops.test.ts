@@ -69,6 +69,13 @@ test("the card groups operations behind Ops and keeps logs and chat public", () 
   assert.match(board, /<ClientChatButton client=\{client\} \/>/);
 });
 
+test("the name row shows only who manages the Client: the tenant while rented, else the owner", () => {
+  assert.match(board, /const manager = rental\s*\? \{ role: t\("dashboard\.renter"\), email: rental\.tenantEmail \|\| t\("clientMarket\.shop\.rentedOut"\) \}\s*: owner && owner !== "-"\s*\? \{ role: t\("dashboard\.owner"\), email: owner \}/);
+  assert.match(board, /title=\{`\$\{manager\.role\} \$\{manager\.email\}`\}>\s*\{manager\.email\}/);
+  // The drawer keeps both.
+  assert.match(board, /<dt className="text-slate-500">\{t\("dashboard\.owner"\)\}<\/dt>[\s\S]*?<dt className="text-slate-500">\{t\("dashboard\.renter"\)\}<\/dt>/);
+});
+
 test("the Ops button renders only when an operation is allowed", () => {
   assert.match(menu, /if \(!access\.console && !access\.terminal && !showUpgrade && !access\.takeover\) return upgrade\.dialog;/);
   // Hover would end at once under a modal popover's underlay.

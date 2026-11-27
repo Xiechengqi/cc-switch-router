@@ -250,7 +250,6 @@ function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidde
               <div className="grid gap-1">
                 <span className="text-xs text-muted-foreground">{t("clientRentals.egress")}</span>
                 <ClientEgressLine listing={{ country: rental.country ?? row.countryCode, egressIp: rental.egressIp ?? null }} emphasize />
-                {rental.egressIp ? <span className="text-xs text-muted-foreground">{t("clientMarket.mine.ipHint")}</span> : null}
                 {rental.egressDiffers ? <span className="text-xs text-amber-800">{t("clientRentals.egressDiffers")}</span> : null}
               </div>
             ) : null}

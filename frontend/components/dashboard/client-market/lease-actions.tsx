@@ -6,7 +6,6 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ClientUpgradeControl } from "@/components/dashboard/client-upgrade-button";
 import { ApiError } from "@/lib/api";
-import { authFetch } from "@/lib/auth";
 import { onlineMarketError, onlineRequest } from "@/lib/online-client-market";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
 import {
@@ -64,21 +63,6 @@ export function LeaseActions({
       setBusy(false);
     }
   }
-  async function backup() {
-    const response = await authFetch(
-      "/v1/client-market/online/leases/" + encodeURIComponent(id) + "/backup",
-      { method: "POST", cache: "no-store" },
-    );
-    if (!response.ok || response.headers.get("content-type") !== "application/zip")
-      throw new Error(t("lease.backupFailed"));
-    const url = URL.createObjectURL(await response.blob());
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "workspace-" + id + ".zip";
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setMessage(t("lease.downloaded"));
-  }
   const status = (
     <>
       {busy && <span role="status">{t("common.loading")}</span>}
@@ -89,11 +73,6 @@ export function LeaseActions({
         </span>
       )}
     </>
-  );
-  const exportButton = (
-    <Button size="sm" variant="outline" isDisabled={busy} onPress={() => void run(backup)}>
-      {t("lease.backup")}
-    </Button>
   );
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -121,12 +100,7 @@ export function LeaseActions({
           </Button>
         </>
       )}
-      {active && (
-        <>
-          {upgradeTarget && <ClientUpgradeControl installationId={id} leased upgradeTarget={upgradeTarget} canInspect available />}
-          {exportButton}
-        </>
-      )}
+      {active && upgradeTarget && <ClientUpgradeControl installationId={id} leased upgradeTarget={upgradeTarget} canInspect available />}
       {canEnd && (
         <Button
           size="sm"
@@ -154,7 +128,6 @@ export function LeaseActions({
             </Modal.Header>
             <Modal.Body className="grid gap-3">
               <p>{t("online.endNotice")}</p>
-              {active && exportButton}
               {preview && (
                 <>
                   <p>

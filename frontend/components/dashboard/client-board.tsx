@@ -367,17 +367,13 @@ function ClientCard({
   const identity = hasSubdomain ? subdomain : client.installation.id;
   const versionLabel = clientPlatformLabel(client);
   const rental = client.rental;
-  const peopleLabel = [
-    owner && owner !== "-" ? `${t("dashboard.owner")} ${owner}` : "",
-    rental ? `${t("dashboard.renter")} ${rental.tenantEmail || t("clientMarket.shop.rentedOut")}` : "",
-    rental?.selfRental ? t("dashboard.selfRental") : "",
-    rental
-      ? t(rental.state === "active" ? "dashboard.rentalActive" : rental.state === "starting" ? "dashboard.rentalStarting" : "dashboard.rentalReturning")
-      : "",
-    rental?.migrationRequired ? t("dashboard.rentalMigration") : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // Only whoever manages the Client now: its tenant while rented, else its
+  // owner. The drawer lists both.
+  const manager = rental
+    ? { role: t("dashboard.renter"), email: rental.tenantEmail || t("clientMarket.shop.rentedOut") }
+    : owner && owner !== "-"
+      ? { role: t("dashboard.owner"), email: owner }
+      : null;
   const showRemoval = state === "offline" && !!client.removalAt && !client.installation.marketListed;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
@@ -449,12 +445,12 @@ function ClientCard({
               {showRemoval ? (
                 <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" />
               ) : null}
-              {/* Owner and renter share the name row to keep the card short. The
+              {/* The managing email shares the name row to keep the card short. The
                   span takes only the space left over (basis 0), so it truncates
                   before the name or the status reason; the title has it in full. */}
-              {peopleLabel ? (
-                <span className="min-w-0 flex-1 basis-0 truncate text-xs text-muted-foreground" title={peopleLabel}>
-                  {peopleLabel}
+              {manager ? (
+                <span className="min-w-0 flex-1 basis-0 truncate text-xs text-muted-foreground" title={`${manager.role} ${manager.email}`}>
+                  {manager.email}
                 </span>
               ) : null}
             </div>

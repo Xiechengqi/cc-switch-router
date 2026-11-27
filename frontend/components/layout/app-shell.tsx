@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, Lock, LogOut, Monitor, Network, ServerCog, Settings, Share2, Trophy, UserRound } from "lucide-react";
+import { Activity, ChevronDown, House, KeyRound, Lock, LogOut, Network, ServerCog, Settings, Share2, Trophy, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -194,7 +194,7 @@ function DashboardNav({
           : "clients";
 
   const items = [
-    { id: "clients" as const, href: DASHBOARD_CLIENTS_PATH, icon: Monitor, label: t("nav.clientsTab") },
+    { id: "clients" as const, href: DASHBOARD_CLIENTS_PATH, icon: House, label: t("nav.clientsTab") },
     {
       id: "share-market" as const,
       href: DASHBOARD_SHARE_MARKET_PATH,
