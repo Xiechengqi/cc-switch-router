@@ -72,7 +72,7 @@ test("buyer receipts stay on the market page and the market gates Owner audit be
   assert.doesNotMatch(shared, /getClientMarketHosts|localStorage|sessionStorage/);
   assert.match(shared, /document.visibilityState === "visible"/);
   assert.match(shared, /!expanded/);
-  assert.match(market, /revision=\{terminationWork.revision\}/);
+  assert.match(market, /auditRevision=\{terminationWork.revision\}/);
   // The audit is an owner-only tab: it reads only while mounted, remounts per
   // account and aborts its reads when the owner leaves the tab.
   const audit = source("components/dashboard/client-market/rental-audit-panel.tsx");

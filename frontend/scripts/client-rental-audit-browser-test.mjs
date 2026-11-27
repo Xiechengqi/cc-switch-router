@@ -92,26 +92,27 @@ try {
   const detail = () => page.getByTestId("rental-audit-detail");
   const detailDialog = () => page.getByRole("dialog", { name: "Rental audit details", exact: true });
   const toggle = () => rows().first().getByRole("button");
+  // The audit is an Owner-only tab beside "My listings"; it reads only while selected.
+  const auditTab = () => page.getByRole("tab", { name: /^(Rental audit|租用审计)$/ });
   const openAudit = async () => {
-    const trigger = page.getByTestId("client-rental-audit-disclosure").getByRole("button");
-    await trigger.waitFor();
-    if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click();
+    await auditTab().waitFor();
+    if (await auditTab().getAttribute("aria-selected") !== "true") await auditTab().click();
   };
   const goto = async (locale, expand = true) => {
     await installFinancialBrowserIdentity(page);
-  await page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
+    await page.goto(`${base}/client-market/?testLocale=${locale || "en"}`);
     if (expand) await openAudit();
   };
   const switchActor = async next => { actor = next; await page.evaluate(() => window.dispatchEvent(new Event("router-auth-changed"))); };
   await goto(undefined, false);
-  await page.getByTestId("client-rental-audit-disclosure").waitFor();
-  assert.equal(await panel().count(), 0, "audit data is absent until explicitly expanded");
-  assert.equal(requests.length, 0, "collapsed audit must not prefetch lists, details or counts");
+  await auditTab().waitFor();
+  assert.equal(await panel().count(), 0, "audit data is absent until the tab is selected");
+  assert.equal(requests.length, 0, "an unselected audit tab must not prefetch lists, details or counts");
   await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   const initialReads = requests.length;
-  await page.getByTestId("client-rental-audit-disclosure").getByRole("button", { name: "Collapse rental audit", exact: true }).click();
-  assert.equal(await panel().count(), 0, "collapsing clears the visible private records");
-  assert.equal(requests.length, initialReads, "collapsing must not issue an audit read");
+  await page.getByRole("tab", { name: "Shop for a Client", exact: true }).click();
+  assert.equal(await panel().count(), 0, "leaving the tab clears the visible private records");
+  assert.equal(requests.length, initialReads, "leaving the tab must not issue an audit read");
   await openAudit(); await panel().getByText("53 matching records · page 1 / 11", { exact: true }).waitFor();
   assert.equal(await rows().count(), 5);
   assert.equal(await detail().count(), 0, "rental details are loaded only on demand");
