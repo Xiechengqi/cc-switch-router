@@ -524,10 +524,12 @@ mod tests {
     fn offer_terms_follow_the_listing_rules() {
         assert!(validate_terms(0, None, 0).is_ok());
         assert!(validate_terms(0, Some(30), 0).is_ok());
+        // The paid trial is set in hours, up to the 720-hour trial policy cap.
         assert!(validate_terms(500, None, 7).is_ok());
+        assert!(validate_terms(500, None, 720).is_ok());
         assert!(validate_terms(500, Some(3), 0).is_err());
         assert!(validate_terms(0, None, 3).is_err());
-        assert!(validate_terms(500, None, 31).is_err());
+        assert!(validate_terms(500, None, 721).is_err());
         assert!(validate_terms(-1, None, 0).is_err());
     }
 
