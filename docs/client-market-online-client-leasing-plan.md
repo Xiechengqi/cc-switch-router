@@ -15,8 +15,8 @@
 | D7 | 从 SSH 托管切换到在线供给时采用空环境。已有在线租赁库通过迁移 0129 保留原租约、报价和回执，新租约直接采用独占管理。 |
 | D8 | 只运行一个常驻进程（即 Client 本身），不在主机上另装 Agent 或 standby。 |
 | D9 | 必须支持 NAT 后的主机。Client 本就通过反向隧道主动连 Router，这一点天然满足。 |
-| D10 | 「选购客户端」统一展示已挂售的 Client，包含商家自己的设备。「我的挂售」单独管理供给。支持自租的设备对卖家本人成交价为零，对外挂牌价继续生效。 |
-| D11 | 租户用下单的 Router 账号进入控制台。owner 的原密码保留在 Client 上，交还后要重新登录。Clients 卡片和抽屉展示完整 owner 和当前租户邮箱。 |
+| D10 | 「选购 Client」统一展示已挂售的 Client，包含商家自己的设备。「我的挂售」单独管理供给。支持自租的设备对卖家本人成交价为零，对外挂牌价继续生效。 |
+| D11 | 租户用下单的 Router 账号进入控制台。owner 的原密码保留在 Client 上，交还后要重新登录。卖家邮箱公开；租户邮箱只对该租约的卖家、租户本人和 Router 管理员可见，其他人看到「已租出」（2026-11-26 调整，见 [改进计划](client-market-improvement-plan.md) P1）。 |
 
 ## 2. 为什么放弃 SSH 托管
 
@@ -48,7 +48,7 @@
 | installation 绑定、owner 邮箱、主机级设置 | 交还后恢复 | 无 | 平台只处理签名租约指令 |
 | 工作区管理、Share、备份、聊天和推理 | 无 | 当前租户 | 按买家账号、别名和有效租约校验 |
 
-Clients 卡片与抽屉公开显示完整 owner 邮箱和当前租户邮箱，交付与交还中也显示租户。释放后移除租户。租户使用自己的 Router 登录，自租免付款并使用同一工作区规则。[代理鉴权](../src/proxy.rs) · [窗口票据](../src/store/client_web_sessions.rs)
+Clients 卡片与抽屉显示完整 owner 邮箱。当前租户邮箱只对该租约的卖家、租户本人和 Router 管理员返回，其他查看者只看到「已租出」；租户 Share 的 owner 邮箱同样按此规则打码。释放后移除租户。[快照过滤](../src/store.rs)租户使用自己的 Router 登录，自租免付款并使用同一工作区规则。[代理鉴权](../src/proxy.rs) · [窗口票据](../src/store/client_web_sessions.rs)
 
 ## 4. cc-switch-server 改造
 
@@ -256,6 +256,9 @@ Router 运营者与 release 发布者目前是同一方，因此本方案不防�
 | 卖家想绕过冻结使用租户账号 | 回环同样需要租户 token；root 直接读盘只能靠告知与信誉约束 |
 | 卖家 Client 版本过旧 | 缺少独占管理能力时暂停新上架、新报价和成交。存量租约在签名确认升级前显示待迁移 |
 | 租户 Share 上仍有第三方车位 | 先走 Share 立即退租与结算，再下发 `lease_end` |
+| 卖家需要收回机器 | 默认提前 24 小时通知（已付租期更早结束则在租期结束时收回；未开通的订单立即取消），期间自动续费关闭、「试用后继续」改为仅试用、租户退租不扣赔付，取消收回后恢复原来的设置；卖家的说明对租户可见并写入退租记录；租户违规时可立即收回，必须写明原因。两种方式都按卖家责任结算，租户未使用的租金全额退回。可选「以后拒绝这个租户」「收回后下架」。[卖家操作](../src/online_client_market/seller.rs) · [到期执行](../src/online_client_market/reconcile.rs) |
+| 租期内出口 IP 变化 | Router 每小时重新验证真实出口；IP 变化时记入租约事件并通知租户（只显示网段与国家）。[出口复核](../src/online_client_market/reconcile.rs) |
+| 卖家想暂停接新订单 | 「暂停接单」不影响当前租约；商店隐藏，报价和成交被拒绝，恢复后可再租。修改条款只影响之后的新订单 |
 
 ## 9. 分期与验收
 
@@ -274,12 +277,16 @@ Router 运营者与 release 发布者目前是同一方，因此本方案不防�
 | 项目 | 当前行为及兼容范围 |
 |---|---|
 | 存量租约 | Clients 与买家租约详情识别待迁移的版本 1 租约。原位更新以有效签名状态为准，保留原租约、别名和账务。首次迁移与交还后升级的路径见第 6 节。[租约核对](../src/online_client_market/reconcile.rs) · [租户升级](../src/online_client_market/upgrades.rs) |
-| 可租供给 | 商店、报价及首次成交、卖家库存、地区统计、排名空闲数和准入申请统一使用供给视图的 `availability`。缺少有效检查快照的已挂牌设备继续接受签名探测。总挂售包含已挂牌的占用或待升级设备，可租数只计 `available`。自租单独核对 `ownerRental`，第三方买家的准入和收费条件仍在交易时核验。[供给视图](../schema/0130_online_client_supply_availability.sql) · [报价与库存](../src/online_client_market.rs) · [地区统计](../src/market_providers.rs) · [排名](../src/market_provider_rank.rs) · [准入](../src/market_access.rs) |
-| 出口地址 | 服务端按地址族生成公开网段，卖家仍能核对完整出口。设备卡片与抽屉公开显示完整租户邮箱。[地址处理](../src/store.rs) · [网络详情](../frontend/components/dashboard/client-market/online-shop.tsx) |
+| 可租供给 | 商店、报价及首次成交、卖家库存、地区统计、排名空闲数和准入申请统一使用供给视图的 `availability`。缺少有效检查快照的已挂牌设备继续接受签名探测。总挂售包含已挂牌的占用或待升级设备，可租数只计 `available`。自租单独核对 `ownerRental`，第三方买家的准入和收费条件仍在交易时核验。[供给视图](../schema/0131_client_market_seller_controls.sql) · [报价与库存](../src/online_client_market.rs) · [地区统计](../src/market_providers.rs) · [排名](../src/market_provider_rank.rs) · [准入](../src/market_access.rs) |
+| 出口地址 | 服务端按地址族生成公开网段，卖家仍能核对完整出口；租户在租期内可看到完整出口 IP。商店卡片以出口国家和网段为首要信息。租户邮箱不再公开（D11）。[地址处理](../src/store.rs) · [出口展示](../frontend/components/dashboard/client-market/online-shop.tsx) |
 | 不可租原因 | 最近十分钟有明确隧道断开记录才显示离线。签名回执可区分升级中和工作区切换中。控制请求失败、缺少观测或观测过期时，已具备独占管理的空闲设备显示暂不可租。[探测与对账](../src/online_client_market/reconcile.rs) · [前端状态](../frontend/components/dashboard/client-market/host-utils.ts) |
 | 旧健康展示 | 已删除停用的 standby 健康组件辅助代码和词库。当前页面请求 `includeAvailableHours24=false`，跳过可用小时聚合。旧版商店还读取 `availableHours24`，原 URL 继续返回真实结果，一次查询按设备和小时汇总。五分钟履约样本仍用于结算。[列表请求](../frontend/lib/online-client-market.ts) · [兼容查询](../src/online_client_market.rs) |
 
 本轮未运行测试或部署。行为验收条件见 [Client Market 用例 H-01 至 H-32](ui-test-plan.md#7-client-market-在线供给h)。
+
+### 9.2 改进计划的实施（2026-11-26）
+
+租户邮箱不公开、卖家收回、公开标题与修改条款、暂停接单、Client 仅试用与精简结账、以出口为中心的商店（30 天在线率、按接入时长排序、搜索与分页、详情抽屉）、「我租的 Client」与开通引导、计费小时展示和用词统一已按 [Client Market 改进实施计划](client-market-improvement-plan.md) 实施。数据库变更见 [迁移 0131](../schema/0131_client_market_seller_controls.sql)，供给视图在其中增加 `paused`。本轮同样未运行测试或部署。
 
 ## 10. 关键代码位置
 

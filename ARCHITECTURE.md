@@ -129,11 +129,11 @@ Bundle 绑定聚合，不从 Claude/Codex/Gemini API、兼容类型或名称猜�
 
 每个上架项对应卖家的一台 installation。Router 经现有隧道发送签名控制请求，Client 经业务实际使用的出站路径回调 Router，确认出口 IP 与地区。每份租约有独立 ID、子域名和工作区。在独占管理租约中，物理域名的控制台关闭，当前买家从租约别名管理应用，Web Terminal 对所有人关闭。只有付费他租建立钱包合同。自租成交价为零，使用同一套工作区与交还流程。
 
-唯一索引限制每台 installation 同时只有一份未释放租约。商店、卖家库存、报价与首次成交、地区统计、排名空闲数和准入申请共用 `online_client_supply.availability`。当设备已挂牌、未占用、签名确认独占管理且最近十分钟探测健康时，状态为 `available`。待完成的退租结算仍占用库存，自租另验 `ownerRental`。[供给视图](schema/0130_online_client_supply_availability.sql) · [实施与兼容范围](docs/client-market-online-client-leasing-plan.md#client-market-design-gaps)
+唯一索引限制每台 installation 同时只有一份未释放租约。商店、卖家库存、报价与首次成交、地区统计、排名空闲数和准入申请共用 `online_client_supply.availability`。当设备已挂牌、未占用、未暂停接单、签名确认独占管理且最近十分钟探测健康时，状态为 `available`；卖家暂停接单时为 `paused`。待完成的退租结算仍占用库存，自租另验 `ownerRental`。卖家可以提前 24 小时收回已租出的 Client（租户违规时可立即收回），按卖家责任退回未使用租金。[供给视图](schema/0131_client_market_seller_controls.sql) · [实施与兼容范围](docs/client-market-online-client-leasing-plan.md#client-market-design-gaps)
 
 上架、授权、延长、撤权和清理的意图都在数据库事务内写入，再由 worker 经 HMAC 控制通道送达。每次重试先读 Client 持久状态和序号。签名回执与正在运行的工作区一致时才开放访问和激活付费合同。退租事务冻结结算时点、撤销租户别名并关闭其 Share 挂售；Share 的车位撤权和结算使用原有流程。租后财务争议按 terminationId 访问，清理回执绑定租约与物理 installation。
 
-卡片的 24 小时在线率按 `installation_health_checks` 中有观测的分钟计算，运行时长从 installation 首次接入 Router 起算。市场每五分钟探测工作区，按 installation、租约和 UTC 时段去重写入 `online_client_probes`，月租履约按这些样本结算。Router 约每小时在签名状态请求中要求 Client 刷新硬件快照。[租赁协议](PROTOCOL.md#在线-client-market-购买与控制协议) · [租用规划](docs/client-market-online-client-leasing-plan.md)
+卡片的 30 天在线率按 `installation_online_days` 最近 30 个 UTC 日汇总（旧 Router 回退为 24 小时），运行时长从 installation 首次接入 Router 起算，商店按它从长到短排序。租户邮箱只对卖家、租户本人和管理员可见。市场每五分钟探测工作区，按 installation、租约和 UTC 时段去重写入 `online_client_probes`，月租履约按这些样本结算。Router 约每小时在签名状态请求中要求 Client 刷新硬件快照。[租赁协议](PROTOCOL.md#在线-client-market-购买与控制协议) · [租用规划](docs/client-market-online-client-leasing-plan.md)
 
 ### ④ Provider Rank —— 跨市场供应商发现
 

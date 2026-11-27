@@ -57,7 +57,7 @@ score = 45% service quality
 
 ### Supply breadth（10%）
 
-已启用 App 数、国家数以及可用 Share seat 和空闲 Client 数形成饱和分数。Share 供给要求 listing 有效、底层 Share active、owner 一致且有未退休的可见 seat，只有已启用的 App binding 计数。Client 总数统计全部已挂牌设备。空闲数与地区可租数都取 `online_client_supply.availability='available'`，要求设备未占用、具备签名独占能力且最近十分钟探测健康。自租能力只影响卖家本人下单。排名按既有周期生成快照。[供给视图](../schema/0130_online_client_supply_availability.sql) · [排名取数](../src/market_provider_rank.rs)
+已启用 App 数、国家数以及可用 Share seat 和空闲 Client 数形成饱和分数。Share 供给要求 listing 有效、底层 Share active、owner 一致且有未退休的可见 seat，只有已启用的 App binding 计数。Client 总数统计全部已挂牌设备。空闲数与地区可租数都取 `online_client_supply.availability='available'`，要求设备未占用、具备签名独占能力且最近十分钟探测健康。自租能力只影响卖家本人下单。排名按既有周期生成快照。[供给视图](../schema/0131_client_market_seller_controls.sql) · [排名取数](../src/market_provider_rank.rs)
 
 TTFT 与 TPS 来自最近 30 天成功、非健康检查且完整结束的流式 Share 请求；TPS 还要求 observed usage 和可信的生成时长，terminal flush 不进入吞吐样本。同一请求只计一次，不因 listing 历史重复加权。两项指标仅作展示，`displayOnly=true`，不参与分数、资格或排序；`sampleCount` 公开参与 TTFT 的流式响应数。
 

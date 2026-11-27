@@ -58,7 +58,7 @@ Client owner 可从 Client Market 的「我的挂售 → 添加」或 Clients �
 
 Clients 页与租户控制台使用短期、一次性且绑定父会话和目标域名的票据自动登录。退租会撤销租户域名和票据，停止计费；Router 在第三方 Share 回收且 Client 确认工作区清理后重新开放库存。在线 Client 使用自身的反向隧道，NAT 后的机器也可以上架。
 
-新环境可用独立数据目录初始化 Router 和 Server。已有在线租赁库经迁移 0129 保留租约和账务，0130 统一市场可租状态。仍使用管理版本 1 的租约会在 Clients 和买家租约详情提示迁移。要继续使用同一租约，由 owner 在宿主更新 Client，Router 核对同一工作区的有效签名状态后开放租户升级。也可以先退租，再由 owner 升级。[环境迁移与验收计划](docs/client-market-online-client-leasing-plan.md#6-环境迁移与验收计划)
+新环境可用独立数据目录初始化 Router 和 Server。已有在线租赁库经迁移 0129 保留租约和账务，0130 统一市场可租状态，0131 增加卖家收回、公开标题、暂停接单和 Client 仅试用。仍使用管理版本 1 的租约会在 Clients 和买家租约详情提示迁移。要继续使用同一租约，由 owner 在宿主更新 Client，Router 核对同一工作区的有效签名状态后开放租户升级。也可以先退租，再由 owner 升级。[环境迁移与验收计划](docs/client-market-online-client-leasing-plan.md#6-环境迁移与验收计划)
 
 ## 边界策略
 

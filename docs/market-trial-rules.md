@@ -44,6 +44,15 @@ Server 的未完成请求若跨进程重启，用量无法从权威日志恢复�
 - 试用期间（合同 `pending_activation`／`trialing`、phase 为 `trial`）可经 `PUT /v1/market-wallet/contracts/:id/after-trial` 切换：改为继续租用时按首期价款检查余额（不足返回 `MARKET_WALLET_REQUIRED` 及缺口，前端就地充值）；改回仅试用会关闭自动续费。试用结束后不可再改（`SHARE_TRIAL_ENDED`）。
 - 一次性试用预算与普通租用共用，仅试用不额外发放、也不重置 scope。
 
+## Client 仅试用
+
+付费 Client 有试用时，结账弹窗同样默认选「仅试用」（迁移 131 放开 `after_trial` 对 `client_host` 的约束）。规则与 Share 相同，差别如下：
+
+- 上限按市场分别计算：每个买家最多同时 3 个仅试用的 Client（`CLIENT_TRIAL_ONLY_LIMIT`），与 Share 的 3 个互不占用。Listing 没有试用或同时要求自动续费时拒绝（`CLIENT_TRIAL_ONLY_UNAVAILABLE`）。
+- 试用期内可在「我租的 Client」或租用详情里切换「试用后自动结束／继续租用」，接口同为 `PUT /v1/market-wallet/contracts/:id/after-trial`；试用已结束、已开始付费或租约不再运行时返回 `CLIENT_TRIAL_ENDED`。
+- 试用耗尽后按原回收链路退租，退租原因为 `trial_completed`，不扣费；清理确认后 Client 恢复可租。
+- 卖家发起收回期间不能开启自动续费（`CLIENT_RECLAIM_PENDING`），也不能切换试用后选择；原本「试用后继续」的试用临时改为仅试用，收回时间不晚于试用结束。卖家取消收回后恢复原来的选择。
+
 ## 升级与验收
 
 新 Share 试用要求 `Share Contract v9`＋`marketTrialV1` 显式协商。普通未协商 descriptor 仍为 v7，市场整体最低版本仍 v5；旧 Server 的免费／关闭试用报价不受影响，真正试用报价明确提示升级，不降级成周期额度。
