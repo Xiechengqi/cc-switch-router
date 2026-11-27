@@ -8,6 +8,8 @@ import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
 import { ClockAlert, Pause, PencilLine, Play, RotateCcw, Undo2 } from "lucide-react";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
+import { RentalHistorySection } from "@/components/common/rental-history-section";
+import { MarketPagination } from "@/components/dashboard/share-market/market-pagination";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { ClientTerminationHostAction } from "@/components/market/client-termination-host-action";
@@ -30,6 +32,8 @@ import { ClientReclaimDialog, type ClientReclaimTarget } from "./client-reclaim-
 import { endReasonKey, onlineStatusKey } from "./host-utils";
 import { ONLINE_CLIENT_CARD_GRID_CLASS, OnlineClientCard, OnlineSellingToolbar, useBilledTime } from "./online-shop";
 import { formatWalletUnits } from "@/lib/market-wallet-money";
+
+const HISTORY_PAGE_SIZE = 5;
 
 function probeKey(code: string): MessageKey {
   switch (code) {
@@ -102,11 +106,16 @@ export function SellerWorkspace({
   const [unlisting, setUnlisting] = React.useState<OnlineListing | null>(null);
   const [editing, setEditing] = React.useState<OnlineListing | null>(null);
   const [reclaiming, setReclaiming] = React.useState<ClientReclaimTarget | null>(null);
+  const [historyPage, setHistoryPage] = React.useState(1);
   const listingById = React.useMemo(() => new Map(listings.map((item) => [item.installationId, item])), [listings]);
   const text = query.trim().toLowerCase();
   const matches = (item: OnlineSellerItem) =>
     !text || [item.label, item.title, item.tenantEmail].some((part) => (part || "").toLowerCase().includes(text));
   const history = items.filter((item) => item.state === "released" && matches(item));
+  // Five per page, like the Share buyer's rental history.
+  const historyPages = Math.max(1, Math.ceil(history.length / HISTORY_PAGE_SIZE));
+  const shownHistoryPage = Math.min(historyPage, historyPages);
+  const pagedHistory = history.slice((shownHistoryPage - 1) * HISTORY_PAGE_SIZE, shownHistoryPage * HISTORY_PAGE_SIZE);
   const rented = items.filter(sellerItemRented);
   const listed = items.filter((item) => item.state !== "released" && !sellerItemRented(item));
   const visibleListed = listed.filter(matches);
@@ -376,13 +385,9 @@ export function SellerWorkspace({
       ) : null}
 
       {history.length ? (
-        <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="client-seller-history">
-          <h3 id="client-seller-history" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            {t("lease.history")}
-            <span className="ml-1.5 tabular-nums text-slate-400">{history.length}</span>
-          </h3>
+        <RentalHistorySection id="client-seller-history" title={t("lease.history")} count={history.length}>
           <ExpandableRecordTable
-            rows={history}
+            rows={pagedHistory}
             rowKey={(row) => row.id}
             rowLabel={nameOf}
             columns={historyColumns}
@@ -409,7 +414,8 @@ export function SellerWorkspace({
               </div>
             )}
           />
-        </section>
+          <MarketPagination page={shownHistoryPage} pageCount={historyPages} onPageChange={setHistoryPage} />
+        </RentalHistorySection>
       ) : null}
 
       <Modal.Backdrop isOpen={!!unlisting} onOpenChange={(open) => !open && !busy && setUnlisting(null)}>

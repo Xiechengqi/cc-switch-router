@@ -59,7 +59,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     const listing = {
       installationId: "online-client", providerId: "provider", label: "Test online Client",
       revision: 7, state: "listed", owned: false, cyclePriceMinor: 1000, freeDays: null,
-      trialDays: 1, country: "JP", egressIp: "192.0.2.xx", egressDiffers: true,
+      trialHours: 24, country: "JP", egressIp: "192.0.2.xx", egressDiffers: true,
       hardware: { arch: "aarch64", cpu: 2, memoryBytes: 2 ** 32, diskBytes: 32 * 2 ** 30 },
       ownerRental: true, exclusiveManagement: true, onlineRate24h: 98.75, observedMinutes24h: 80, observationCoverage24h: 5.56,
       healthy: true, occupied: false, observedAt: Math.floor(Date.now()/1000), availability: "available",
@@ -144,7 +144,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
             selfRental: listing.owned, listingPriceMinor: listing.cyclePriceMinor,
             cyclePriceMinor: listing.owned ? 0 : listing.cyclePriceMinor,
             freeDays: listing.owned ? null : listing.freeDays,
-            trialSeconds: !listing.owned && listing.trialDays ? 498 : 0,
+            trialSeconds: !listing.owned && listing.trialHours ? 498 : 0,
             autoRenew: !listing.owned && input.autoRenew,
             terminationPolicy: { version: 1, rateBps: 1000 },
           },
@@ -289,7 +289,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     assert.equal(new URL(page.url()).pathname, "/client-market/");
     await page.clock.setFixedTime(new Date());
     listing.cyclePriceMinor = 0;
-    listing.trialDays = 0;
+    listing.trialHours = 0;
     listing.freeDays = 7;
     ttl = 2;
     await page.goto(baseUrl + "/client-market/?testLocale=zh-CN&country=JP");
@@ -303,7 +303,7 @@ if (captureScreenshots) await mkdir(artifacts, { recursive: true });
     await page.locator("#my-client-lease-1").waitFor();
     listing.cyclePriceMinor = 4200;
     listing.freeDays = null;
-    listing.trialDays = 3;
+    listing.trialHours = 72;
     listing.owned = true;
     listing.onlineRate24h = null;
     listing.observedMinutes24h = 0;

@@ -60,6 +60,7 @@ export function ClientShopFilters({
   query,
   onQuery,
   rentable,
+  mine,
 }: {
   cards: ShopCountryCard[];
   continent: ShopContinent;
@@ -69,6 +70,11 @@ export function ClientShopFilters({
   query: string;
   onQuery: (next: string) => void;
   rentable: { pressed: boolean; label: string; onClick: () => void };
+  /**
+   * "Mine", left of "All": the buyer's rentals and rental history instead of
+   * the shop. Disabled for guests and for buyers who never rented a Client.
+   */
+  mine?: { selected: boolean; enabled: boolean; count: number; label: string; hint: string; onSelect: () => void };
 }) {
   const { locale, t } = useLocaleText();
   const regionName = useRegionName();
@@ -85,16 +91,31 @@ export function ClientShopFilters({
           aria-label={t("clientMarket.shop.continentLabel")}
           className="flex min-w-0 flex-1 basis-full items-center gap-1 overflow-x-auto sm:basis-auto"
         >
+          {mine ? (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mine.selected}
+              title={mine.hint}
+              disabled={!mine.selected && !mine.enabled}
+              className={shopChip(mine.selected)}
+              onClick={() => !mine.selected && mine.onSelect()}
+            >
+              <span>{mine.label}</span>
+              {mine.count ? <span className={shopChipCount(mine.selected)}>{mine.count}</span> : null}
+            </button>
+          ) : null}
           {SHOP_CONTINENTS.map((value) => {
             const members = inContinent(value);
-            const selected = value === continent;
+            const selected = !mine?.selected && value === continent;
             return (
               <button
                 key={value}
                 type="button"
                 role="tab"
                 aria-selected={selected}
-                disabled={!selected && members.length === 0}
+                // "All" is the way back from "Mine", so it is never disabled.
+                disabled={!selected && value !== "all" && members.length === 0}
                 className={shopChip(selected)}
                 onClick={() => onContinent(selected ? "all" : value)}
               >
@@ -104,38 +125,42 @@ export function ClientShopFilters({
             );
           })}
         </div>
-        <button
-          type="button"
-          aria-pressed={rentable.pressed}
-          className={shopChip(rentable.pressed)}
-          onClick={rentable.onClick}
-        >
-          <CircleDot className={cn("h-3.5 w-3.5", rentable.pressed ? "text-sky-600" : "text-slate-400")} aria-hidden />
-          <span className="whitespace-nowrap">{rentable.label}</span>
-        </button>
-        <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary sm:grow-0">
-          <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
-          <input
-            type="search"
-            aria-label={t("clientMarket.shop.search")}
-            placeholder={t("clientMarket.shop.search")}
-            value={query}
-            className="min-w-0 flex-1 bg-transparent text-xs outline-none [&::-webkit-search-cancel-button]:hidden"
-            onChange={(event) => onQuery(event.target.value)}
-          />
-          {query ? (
+        {mine?.selected ? null : (
+          <>
             <button
               type="button"
-              aria-label={t("common.reset")}
-              className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-              onClick={() => onQuery("")}
+              aria-pressed={rentable.pressed}
+              className={shopChip(rentable.pressed)}
+              onClick={rentable.onClick}
             >
-              <X className="h-3.5 w-3.5 text-slate-400" aria-hidden />
+              <CircleDot className={cn("h-3.5 w-3.5", rentable.pressed ? "text-sky-600" : "text-slate-400")} aria-hidden />
+              <span className="whitespace-nowrap">{rentable.label}</span>
             </button>
-          ) : null}
-        </label>
+            <label className="flex h-9 w-44 shrink-0 grow items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary sm:grow-0">
+              <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
+              <input
+                type="search"
+                aria-label={t("clientMarket.shop.search")}
+                placeholder={t("clientMarket.shop.search")}
+                value={query}
+                className="min-w-0 flex-1 bg-transparent text-xs outline-none [&::-webkit-search-cancel-button]:hidden"
+                onChange={(event) => onQuery(event.target.value)}
+              />
+              {query ? (
+                <button
+                  type="button"
+                  aria-label={t("common.reset")}
+                  className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  onClick={() => onQuery("")}
+                >
+                  <X className="h-3.5 w-3.5 text-slate-400" aria-hidden />
+                </button>
+              ) : null}
+            </label>
+          </>
+        )}
       </div>
-      {countries.length > 0 ? (
+      {countries.length > 0 && !mine?.selected ? (
         <div
           className="-mx-1 flex min-w-0 gap-1 overflow-x-auto px-1 pb-1 [scrollbar-width:thin]"
           role="group"
@@ -307,7 +332,8 @@ export function useBilledTime() {
 export function useListingPrice() {
   const { locale, t } = useLocaleText();
   const days = React.useMemo(() => new Intl.NumberFormat(locale, { style: "unit", unit: "day", unitDisplay: "long" }), [locale]);
-  return (listing: Pick<OnlineListing, "owned" | "cyclePriceMinor" | "trialDays" | "freeDays">) => ({
+  const hours = React.useMemo(() => new Intl.NumberFormat(locale, { style: "unit", unit: "hour", unitDisplay: "long" }), [locale]);
+  return (listing: Pick<OnlineListing, "owned" | "cyclePriceMinor" | "trialHours" | "freeDays">) => ({
     price: listing.owned
       ? t("clientMarket.shop.selfFree")
       : listing.cyclePriceMinor > 0
@@ -316,8 +342,8 @@ export function useListingPrice() {
     monthly: !listing.owned && listing.cyclePriceMinor > 0,
     term: listing.owned
       ? ""
-      : listing.trialDays > 0
-        ? t("lease.trialDays", { duration: days.format(listing.trialDays) })
+      : listing.trialHours > 0
+        ? t("lease.trial", { duration: hours.format(listing.trialHours) })
         : listing.freeDays
           ? days.format(listing.freeDays)
           : "",

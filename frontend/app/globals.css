@@ -660,9 +660,13 @@ textarea:-webkit-autofill:focus {
   font-weight: 600;
 }
 
-a {
-  color: inherit;
-  text-decoration: none;
+/* Layered so a link's own Tailwind color (e.g. `text-white` on a dark
+ * button-styled link) wins; unlayered CSS would override every utility. */
+@layer base {
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
 }
 
 .gradient-accent {

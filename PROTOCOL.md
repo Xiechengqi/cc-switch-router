@@ -393,6 +393,7 @@ Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／install
 | `POST` | `/v1/share-market/subscriptions/:id/release` | 租客归还 |
 | `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收,可同时拒绝该买家后续 Share 租用 |
 | `GET` | `/v1/share-market/subscriptions/:id/value-usage` | 当前付费账期的 API 等值估算；仅该租约买家或卖家，所有响应 `private, no-store` |
+| `GET` | `/v1/share-market/me/rental-history?page=N` | 卖家「我的挂售」底部的租用历史：调用者自己车位上已结束(`ended`)的租约，每页 5 条；只返回白名单字段(Share、车位、租客邮箱、起止时间、计价)与 `incomeUnits`(Provider 净收入 + 提前终止补偿，证据缺失为 null)，`private, no-store` |
 
 `alreadyListed` 作为兼容字段,在当前 owner 有 active listing 或 Share 仍有非终态订阅时为 true；新 UI 以 `canCreateListing`、`activeListingId` 与 `reopenListingId` 决定动作。只要存在未删除的 closed listing,`POST /listings` 返回 `share_market_reopen_required` 及原 `listingId`,不得创建重复 listing。
 
@@ -422,7 +423,7 @@ Server 发出最终 applied ACK 前须将其写入绑定原 Router URL／install
 
 无论所选价格，`paidReady` 和 `paidBlocker` 均说明当前账号的收费资格。预检不会认领供应商身份。已验证邮箱的设备所有者首次收费时可调用 `POST /v1/client-market/online/installations/:id/verify-provider` 认领自己的供应商身份，成功返回 `{"paidReady":true}`，重复调用不会创建第二个身份。验证和正式上架分别提交。上架时 Router 重新核验设备和收费条件，已知阻塞通过 `CLIENT_LISTING_BLOCKED` 的 `details.reason` 返回。
 
-公开库存使用 `GET /v1/client-market/online/listings`。有登录态的卖家在 `POST /v1/client-market/online/installations/:id/listing` 提交 `cyclePriceMinor`（USD 分）、可选 `freeDays`、`trialDays` 和 `acknowledged`。同一路径的 GET 仅限卖家读取 `state`、`hostSyncState`（`confirmed` / `pending` / `waiting_reconnect` / `after_rental`）、下架时间和真实命令发送次数；运行记录回收后仍可读取。DELETE 幂等完成市场下架并返回 `unlisted`，不依赖 Client 在线。已有租约继续履约和结算，本机解除挂售锁作为独立意图协调，不能覆盖租约控制命令。POST 返回 `locking` 表示上架意图已记录，最终状态通过库存读取。出口探测以一次性 challenge 向 Router 回调，过期、复用和与上架项不匹配的回调均无效。
+公开库存使用 `GET /v1/client-market/online/listings`。有登录态的卖家在 `POST /v1/client-market/online/installations/:id/listing` 提交 `cyclePriceMinor`（USD 分）、可选 `freeDays`、`trialHours`（免费试用小时数，0–720）和 `acknowledged`。同一路径的 GET 仅限卖家读取 `state`、`hostSyncState`（`confirmed` / `pending` / `waiting_reconnect` / `after_rental`）、下架时间和真实命令发送次数；运行记录回收后仍可读取。DELETE 幂等完成市场下架并返回 `unlisted`，不依赖 Client 在线。已有租约继续履约和结算，本机解除挂售锁作为独立意图协调，不能覆盖租约控制命令。POST 返回 `locking` 表示上架意图已记录，最终状态通过库存读取。出口探测以一次性 challenge 向 Router 回调，过期、复用和与上架项不匹配的回调均无效。
 
 列表的 `state` 表示挂售生命周期，`availability` 表示设备能否交付。公开挂牌的设备返回 `available`、`occupied`、`offline`、`upgrading`、`switching`、`upgrade_required` 或 `unavailable`。卖家还能看到上架过渡 `locking`；旧 `unlocking` 迁移为 `unlisted` 并保留本机同步意图。已下架且无在租订单的设备从当前挂售列表移除；在租下架仍保留租约详情。未释放租约或待完成的退租结算记为占用。空闲设备只有在十分钟内确认隧道断开时才记为离线，升级与切换取自同一时限内的签名回执。可租还要求租赁能力、签名独占能力及有效的健康探测。自租能力 `ownerRental` 单列，只对本人下单生效。
 

@@ -1333,7 +1333,7 @@ mod tests {
             "released"
         );
     }
-    fn paid_listing(tx: &Transaction<'_>, trial_days: u32) {
+    fn paid_listing(tx: &Transaction<'_>, trial_hours: u32) {
         listed(tx);
         let at = Utc::now().to_rfc3339();
         tx.execute(
@@ -1347,8 +1347,8 @@ mod tests {
         }
         crate::market_access::configure_open_test_policy(tx, &actor("owner"), "USD", 1000, &at);
         tx.execute(
-            "UPDATE online_client_listings SET cycle_price_minor=1000,trial_days=?1 WHERE installation_id='physical'",
-            params![trial_days],
+            "UPDATE online_client_listings SET cycle_price_minor=1000,trial_hours=?1 WHERE installation_id='physical'",
+            params![trial_hours],
         )
         .unwrap();
         crate::market_wallet::credit_verified_topup_tx(
@@ -1368,7 +1368,7 @@ mod tests {
             let c = crate::test_support::database().unwrap();
             let tx = c.transaction().unwrap();
             if paid {
-                paid_listing(&tx, 7);
+                paid_listing(&tx, 7 * 24);
             } else {
                 listed(&tx);
                 tx.execute("UPDATE online_client_listings SET free_days=2", [])
@@ -1472,7 +1472,7 @@ mod tests {
     fn checkout_after_trial_reset_requires_a_fresh_quote_even_with_the_same_remaining_time() {
         let c = crate::test_support::database().unwrap();
         let tx = c.transaction().unwrap();
-        paid_listing(&tx, 1);
+        paid_listing(&tx, 24);
         let buyer = actor("alpha");
         let quote = offer(&tx, &buyer);
         let balance = crate::market_wallet::wallet_snapshot_tx(&tx, "alpha").unwrap();

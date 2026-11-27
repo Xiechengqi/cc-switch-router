@@ -461,6 +461,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../schema/0132_client_identity_and_offline_unlisting.sql"),
     ),
     (133, include_str!("../schema/0133_share_market_rental_audit.sql")),
+    (134, include_str!("../schema/0134_client_listing_trial_hours.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

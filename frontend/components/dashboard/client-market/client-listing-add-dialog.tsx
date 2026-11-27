@@ -2,15 +2,15 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { ArrowUpRight, ChevronDown, Loader2 } from "lucide-react";
+import { ArrowUpRight, Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ApiError, getDashboard } from "@/lib/api";
 import {
   buildDashboardHref,
   clientMarketMineHref,
   DASHBOARD_CLIENTS_PATH,
-  shareMarketHref,
 } from "@/lib/dashboard-nav";
 import {
   listingBlocker,
@@ -30,7 +30,8 @@ type Issue =
   | "check_unavailable"
   | "submit_uncertain"
   | "verify_uncertain";
-type Remedy = "listing" | "shares" | "client" | "verifyProvider" | "recheck" | "signIn" | "wait";
+// `wait`: nothing to do from here (the seller finishes it elsewhere, or it clears by itself).
+type Remedy = "listing" | "client" | "verifyProvider" | "recheck" | "signIn" | "wait";
 const remedies: Record<Issue, Remedy> = {
   already_listed: "listing",
   listing_changed: "recheck",
@@ -38,7 +39,7 @@ const remedies: Record<Issue, Remedy> = {
   inactive: "client",
   upgrade_required: "client",
   offline: "client",
-  share_in_use: "shares",
+  share_in_use: "wait",
   workspace_busy: "wait",
   control_unavailable: "recheck",
   egress_unverified: "recheck",
@@ -55,7 +56,6 @@ const remedies: Record<Issue, Remedy> = {
 };
 const actionLabels = {
   listing: "clientMarket.listing.seeListings",
-  shares: "clientMarket.listing.manageShares",
   client: "clientMarket.listing.manageClient",
   verifyProvider: "clientMarket.listing.verifyProvider",
   recheck: "clientMarket.listing.recheck",
@@ -114,7 +114,6 @@ export function ClientListingAddDialog({
   const [probe, setProbe] = React.useState<Probe | null>(null);
   const [revision, recheck] = React.useReducer((n) => n + 1, 0);
   const [draft, setDraft] = React.useState<ListingTermsDraft>(EMPTY_LISTING_TERMS);
-  const [ack, setAck] = React.useState(false);
   const [pendingAction, setPendingAction] = React.useState<"verify" | "publish" | null>(null);
   const mutation = React.useRef<AbortController | null>(null);
   const [signingIn, setSigningIn] = React.useState(false);
@@ -182,8 +181,11 @@ export function ClientListingAddDialog({
     };
   }, [selectedId, revision]);
 
-  const lastProbe = probe?.id === selectedId && probe?.revision === revision ? probe : null;
+  // A re-check keeps the last answer on screen, so the dialog never flashes
+  // back to "checking"; only a device's first check shows the spinner.
+  const lastProbe = probe?.id === selectedId ? probe : null;
   const checking = !!selected && !lastProbe;
+  const rechecking = !!lastProbe && lastProbe.revision !== revision;
   const check = lastProbe?.data;
   const terms = listingTermsFrom(draft);
   const paid = terms.paid;
@@ -260,16 +262,15 @@ export function ClientListingAddDialog({
     setProbe(null);
     recheck();
     setDraft(EMPTY_LISTING_TERMS);
-    setAck(false);
     setSubmitIssue(null);
     setTermsRejected(false);
   }
   const busy = pendingAction !== null;
-  const canSubmit = !!selected && !!check?.ready && !issue && !!terms.payload && ack && !busy && !loadError;
+  const canSubmit = !!selected && !!check?.ready && !issue && !!terms.payload && !busy && !rechecking && !loadError;
 
   async function perform(action: "publish" | "verify") {
     if (!selectedId || mutation.current) return;
-    if (action === "publish" ? !canSubmit || !terms.payload : remedy !== "verifyProvider" || checking) return;
+    if (action === "publish" ? !canSubmit || !terms.payload : remedy !== "verifyProvider" || checking || rechecking) return;
     const ctl = new AbortController();
     mutation.current = ctl;
     setPendingAction(action);
@@ -294,7 +295,8 @@ export function ClientListingAddDialog({
       const result = await onlineRequest<{ state: string }>(
         `${endpoint}/listing`,
         "POST",
-        { ...terms.payload, acknowledged: ack },
+        // The dialog states these lease rules before publishing.
+        { ...terms.payload, acknowledged: true },
         ctl.signal,
       );
       if (mutation.current !== ctl) return;
@@ -335,11 +337,10 @@ export function ClientListingAddDialog({
       );
     if (!clients || checking) return null;
     const action = clients.length ? remedy : "client";
-    if (action === "client" || action === "listing" || action === "shares") {
+    if (action === "client" || action === "listing") {
       const links = {
         client: clientHref,
         listing: clientMarketMineHref(selectedId),
-        shares: shareMarketHref({ workspace: "selling" }),
       };
       return (
         <a
@@ -358,7 +359,7 @@ export function ClientListingAddDialog({
     }
     if (action === "verifyProvider")
       return (
-        <Button variant="primary" isDisabled={busy} onPress={() => void perform("verify")}>
+        <Button variant="primary" isDisabled={busy || rechecking} onPress={() => void perform("verify")}>
           {t(pendingAction === "verify" ? "clientMarket.listing.verifying" : actionLabels.verifyProvider)}
         </Button>
       );
@@ -427,33 +428,22 @@ export function ClientListingAddDialog({
                   {clients.length === 1 && selected ? (
                     <strong className="break-all font-mono text-base">{deviceName(selected)}</strong>
                   ) : (
-                    <label className="group relative flex min-h-11 min-w-0 items-center justify-between gap-3 rounded-lg border border-border bg-background px-3 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2">
-                      <span aria-hidden="true" className="truncate font-mono text-sm font-semibold">
-                        {selected ? deviceName(selected) : t("clientMarket.listing.choose")}
-                      </span>
-                      <span aria-hidden="true" className="inline-flex items-center gap-1 text-sm text-primary">
-                        {t("clientMarket.listing.change")}
-                        <ChevronDown className="size-4" />
-                      </span>
-                      <select
-                        aria-label={t("clientMarket.shop.dialog.select")}
-                        value={id ?? ""}
-                        disabled={busy}
-                        className="absolute inset-0 size-full cursor-pointer opacity-0"
-                        onChange={(e) => select(e.target.value)}
-                      >
-                        {!selected && (
-                          <option value="" disabled>
-                            {t("clientMarket.listing.choose")}
-                          </option>
-                        )}
-                        {clients.map((c) => (
-                          <option key={c.installation.id} value={c.installation.id}>
-                            {deviceName(c)}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                    <CompactSelect
+                      ariaLabel={t("clientMarket.shop.dialog.select")}
+                      value={id ?? ""}
+                      disabled={busy}
+                      className="w-full"
+                      triggerClassName="h-9 w-full"
+                      onChange={select}
+                      options={[
+                        ...(selected ? [] : [{ value: "", label: t("clientMarket.listing.choose") }]),
+                        ...clients.map((c) => ({
+                          value: c.installation.id,
+                          label: deviceName(c),
+                          content: <span className="block truncate font-mono text-xs font-semibold">{deviceName(c)}</span>,
+                        })),
+                      ]}
+                    />
                   )}
                   {!selected && id === "" && (
                     <p className="text-sm text-muted-foreground">
@@ -487,7 +477,7 @@ export function ClientListingAddDialog({
                       void perform("publish");
                     }}
                     onChange={() => setTermsRejected(false)}
-                    className="mt-4 grid gap-4 border-t border-border pt-4"
+                    className="mt-4 grid gap-4"
                   >
                     <ListingTermsFields
                       draft={draft}
@@ -500,19 +490,7 @@ export function ClientListingAddDialog({
                       showPricing={!paidOnly}
                     />
                     {!paidOnly && (
-                      <>
-                        <label className="flex min-h-11 cursor-pointer items-center gap-2.5 border-t border-border pt-3 text-sm leading-5">
-                          <input
-                            type="checkbox"
-                            className={"size-4 shrink-0 accent-primary " + focus}
-                            required
-                            checked={ack}
-                            disabled={busy}
-                            onChange={(e) => setAck(e.target.checked)}
-                          />
-                          {t("clientMarket.listing.consent")}
-                        </label>
-                      </>
+                      <p className="text-xs leading-5 text-muted-foreground">{t("clientMarket.listing.notice")}</p>
                     )}
                   </form>
                 )}
@@ -525,7 +503,7 @@ export function ClientListingAddDialog({
                   issue && (
                     <div
                       role="status"
-                      className="mt-4 grid gap-1 rounded-lg border border-border bg-secondary/60 px-4 py-3"
+                      className="mt-4 grid gap-1 rounded-lg bg-slate-100 px-4 py-3"
                     >
                       <strong className="text-sm font-semibold">{t(issueHeading)}</strong>
                       <p className="text-sm leading-5 text-muted-foreground">
@@ -542,7 +520,7 @@ export function ClientListingAddDialog({
               </>
             )}
           </Modal.Body>
-          <Modal.Footer className="mt-0! flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3 sm:px-6">
+          <Modal.Footer className="mt-0! flex shrink-0 flex-wrap items-center justify-end gap-2 px-5 pt-1 pb-5 sm:px-6">
             <Button variant="ghost" isDisabled={busy} onPress={onClose}>
               {t("common.cancel")}
             </Button>

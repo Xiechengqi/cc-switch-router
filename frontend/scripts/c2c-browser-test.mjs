@@ -27,7 +27,7 @@ try {
   const personalRentalReads = [];
   let policy = { version: 1, enabled: true, admissionMinor: 10000, minMinor: 100, maxMinor: 500000, paymentMinutes: 30 };
   let profile = null; let sellerUnits = "1728000000"; let available = true; let pauseCount = 0; let financeFailure = false; let terminationFailure = false; let sellerReadFailure = false; let heldIncome = false;
-  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialDays = 0;
+  let topupMode = "shadow"; let publicationReady = true; let retiredSetupRequests = 0; let offerWrites = 0; let expectedTrialHours = 0;
   let publicationShareInUse = false;
   const listedId = "publication-client";
   const description = "Bank transfer · contact @seller · https://seller.example.invalid/pay · <b>plain text</b>";
@@ -112,7 +112,7 @@ try {
         assert.equal(actor, "seller");
         if (!publicationReady) return json(route, { code: "CLIENT_LISTING_BLOCKED", details: { reason: "provider_verification" } }, 403);
         if (financeFailure) return json(route, {message:"Provider finance temporarily unavailable"},503);
-        assert.deepEqual(body,{cyclePriceMinor:1000,freeDays:null,trialDays:expectedTrialDays,acknowledged:true});
+        assert.deepEqual(body,{cyclePriceMinor:1000,freeDays:null,trialHours:expectedTrialHours,acknowledged:true});
         offerWrites++;
         return json(route,{state:"locking"});
       }
@@ -561,47 +561,42 @@ try {
     await sell.page.goto(`${base}/client-market/?view=selling&add=1&installation=${listedId}`);
     return sell.page.getByRole("dialog", { name: "List a Client" });
   };
-  const openOffer = async trialDays => {
+  const openOffer = async trialHours => {
     const dialog = await openListing();
     await dialog.getByRole("radio", { name: "Monthly rent" }).press("Space");
     await dialog.getByRole("textbox", { name: /Monthly price/ }).fill("10");
-    if (trialDays) {
-      await dialog.getByRole("button", { name: "Add trial" }).click();
-      await dialog.getByRole("textbox", { name: "Free trial" }).fill(String(trialDays));
-    }
-    await dialog.getByRole("checkbox").check();
+    if (trialHours) await dialog.getByRole("textbox", { name: /Free trial/ }).fill(String(trialHours));
     return dialog;
   };
   publicationShareInUse = true;
   const blocked = await openListing();
-  await blocked.getByRole("link", { name: "Manage Share listings" }).waitFor();
+  await blocked.getByText(/active Share listing/).waitFor();
+  assert.equal(await blocked.getByRole("link").count(), 0);
   assert.equal(await blocked.getByRole("radio").count(), 0);
   assert.equal(await blocked.getByRole("checkbox").count(), 0);
   publicationShareInUse = false;
   await sell.page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await blocked.getByRole("button", { name: "Set limit" }).click();
-  await blocked.getByRole("textbox", { name: "Free days per renter" }).fill("90");
+  await blocked.getByRole("textbox", { name: /Free days per renter/ }).fill("90");
   await blocked.getByRole("radio", { name: "Monthly rent" }).press("Space");
-  await blocked.getByRole("button", { name: "Add trial" }).click();
-  await blocked.getByRole("textbox", { name: "Free trial" }).fill("7");
+  await blocked.getByRole("textbox", { name: /Free trial/ }).fill("7");
   await blocked.getByRole("radio", { name: "Free", exact: true }).press("Space");
-  assert.equal(await blocked.getByRole("textbox", { name: "Free days per renter" }).inputValue(), "90");
+  assert.equal(await blocked.getByRole("textbox", { name: /Free days per renter/ }).inputValue(), "90");
   await blocked.getByRole("radio", { name: "Monthly rent" }).press("Space");
-  assert.equal(await blocked.getByRole("textbox", { name: "Free trial" }).inputValue(), "7");
+  assert.equal(await blocked.getByRole("textbox", { name: /Free trial/ }).inputValue(), "7");
   await blocked.getByRole("button", { name: "Cancel" }).click();
-  for (const [mode, days] of [["disabled",0],["shadow",1],["enabled",6]]) {
+  for (const [mode, hours] of [["disabled",0],["shadow",24],["enabled",6]]) {
     topupMode = mode;
-    expectedTrialDays = days;
+    expectedTrialHours = hours;
     await sell.page.goto(`${base}/account/wallet/`);
     await sell.page.getByRole("button", { name: /^Send to someone/ }).click();
     await sell.page.locator("#wallet-transfer form").waitFor();
-    const dialog = await openOffer(days);
+    const dialog = await openOffer(hours);
     await dialog.getByRole("button", { name: "Publish listing", exact: true }).click();
     await dialog.waitFor({state:"hidden"});
   }
   assert.equal(offerWrites,3);
   topupMode = "disabled";
-  const publicationDialog = await openOffer(expectedTrialDays);
+  const publicationDialog = await openOffer(expectedTrialHours);
   publicationReady = false;
   const submitListing = publicationDialog.getByRole("button", { name: "Publish listing", exact: true });
   await submitListing.click();

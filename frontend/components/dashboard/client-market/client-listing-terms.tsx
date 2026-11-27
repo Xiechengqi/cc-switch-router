@@ -1,8 +1,8 @@
 "use client";
 /*
  * Rental terms a seller sets on a Client listing: a public title, free or
- * monthly, and the free-day limit or trial. Shared by "add listing" and
- * "change terms"; changed terms apply to the next order only.
+ * monthly, and the free-day limit (free) or trial hours (monthly). Shared by
+ * "add listing" and "change terms"; changed terms apply to the next order only.
  */
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
@@ -18,25 +18,28 @@ import {
 } from "@/lib/online-client-market";
 import { cn } from "@/lib/utils";
 
+/** An empty `freeDays` means no limit; an empty `trialHours` means no trial. */
 export type ListingTermsDraft = {
   mode: "free" | "monthly";
   price: string;
-  freeDays: string | null;
-  trialDays: string | null;
+  freeDays: string;
+  trialHours: string;
   title: string;
 };
 
-export const EMPTY_LISTING_TERMS: ListingTermsDraft = { mode: "free", price: "", freeDays: null, trialDays: null, title: "" };
+export const EMPTY_LISTING_TERMS: ListingTermsDraft = { mode: "free", price: "", freeDays: "", trialHours: "", title: "" };
+const MAX_FREE_DAYS = 365;
+const MAX_TRIAL_HOURS = 720;
 
 export function draftFromListing(
-  listing: Pick<OnlineListing, "cyclePriceMinor" | "freeDays" | "trialDays" | "title">,
+  listing: Pick<OnlineListing, "cyclePriceMinor" | "freeDays" | "trialHours" | "title">,
 ): ListingTermsDraft {
   const paid = listing.cyclePriceMinor > 0;
   return {
     mode: paid ? "monthly" : "free",
     price: paid ? (listing.cyclePriceMinor / 100).toFixed(2) : "",
-    freeDays: !paid && listing.freeDays ? String(listing.freeDays) : null,
-    trialDays: paid && listing.trialDays > 0 ? String(listing.trialDays) : null,
+    freeDays: !paid && listing.freeDays ? String(listing.freeDays) : "",
+    trialHours: paid && listing.trialHours > 0 ? String(listing.trialHours) : "",
     title: listing.title ?? "",
   };
 }
@@ -44,28 +47,27 @@ export function draftFromListing(
 /** Validate the draft. `payload` is present only when every field is valid. */
 export function listingTermsFrom(draft: ListingTermsDraft) {
   const paid = draft.mode === "monthly";
-  const days = paid ? draft.trialDays : draft.freeDays;
-  const maxDays = paid ? 30 : 365;
-  const validDays = days === null || (/^\d+$/.test(days) && Number(days) >= 1 && Number(days) <= maxDays);
+  // Free listings limit days per renter; monthly listings offer a trial in hours.
+  const term = (paid ? draft.trialHours : draft.freeDays).trim();
+  const maxTerm = paid ? MAX_TRIAL_HOURS : MAX_FREE_DAYS;
+  const validTerm = !term || (/^\d+$/.test(term) && Number(term) >= 1 && Number(term) <= maxTerm);
   const minor = paid ? parseNonNegativeUsdMinor(draft.price.trim().replace(/^0+(?=\d)/, "")) : 0;
   const validPrice = !paid || (minor !== null && minor > 0 && minor <= 100_000_000);
   const validTitle = validListingTitle(draft.title);
   const payload: ListingTermsPayload | null =
-    validDays && validPrice && validTitle && minor !== null
+    validTerm && validPrice && validTitle && minor !== null
       ? {
           cyclePriceMinor: minor,
-          freeDays: !paid && draft.freeDays !== null ? Number(draft.freeDays) : null,
-          trialDays: paid && draft.trialDays !== null ? Number(draft.trialDays) : 0,
+          freeDays: !paid && term ? Number(term) : null,
+          trialHours: paid && term ? Number(term) : 0,
           title: draft.title.trim() || null,
         }
       : null;
-  return { paid, days, maxDays, validDays, validPrice, validTitle, payload };
+  return { paid, term, maxTerm, validTerm, validPrice, validTitle, payload };
 }
 
 const numberField =
-  "flex h-11 min-w-0 items-center gap-2 rounded-lg border border-border bg-background px-3 focus-within:border-accent focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-2";
-const textAction =
-  "min-h-10 shrink-0 rounded-md px-1 text-sm font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2";
+  "flex h-9 min-w-0 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary";
 
 export function ListingTermsFields({
   draft,
@@ -82,9 +84,8 @@ export function ListingTermsFields({
   showPricing?: boolean;
 }) {
   const { t } = useLocaleText();
-  const { paid, days, maxDays, validDays, validPrice, validTitle } = listingTermsFrom(draft);
+  const { paid, term, maxTerm, validTerm, validPrice, validTitle } = listingTermsFrom(draft);
   const set = (patch: Partial<ListingTermsDraft>) => onChange({ ...draft, ...patch });
-  const setDays = (value: string | null) => set(paid ? { trialDays: value } : { freeDays: value });
   return (
     <div className="grid gap-4">
       <label className="grid gap-1.5 text-sm font-medium">
@@ -119,7 +120,7 @@ export function ListingTermsFields({
                 checked={draft.mode === value}
                 onChange={() => set({ mode: value })}
               />
-              <span className="flex min-h-10 items-center justify-center rounded-md text-sm font-medium text-muted-foreground peer-checked:bg-card peer-checked:text-foreground peer-checked:shadow-sm peer-focus-visible:ring-2 peer-focus-visible:ring-accent peer-disabled:opacity-60">
+              <span className="flex h-8 items-center justify-center rounded-md text-sm font-medium text-muted-foreground peer-checked:bg-card peer-checked:text-foreground peer-checked:shadow-sm peer-focus-visible:ring-2 peer-focus-visible:ring-accent peer-disabled:opacity-60">
                 {t(value === "free" ? "online.free" : "clientMarket.listing.monthly")}
               </span>
             </label>
@@ -152,57 +153,29 @@ export function ListingTermsFields({
               ) : null}
             </label>
           ) : null}
-          <div className="grid gap-1.5">
-            <div className="flex min-h-10 flex-wrap items-center gap-x-3">
-              <span id={`${idPrefix}-term`} className="text-sm font-medium">
-                {t(paid ? "clientMarket.listing.trial" : "clientMarket.listing.freeDays")}
-              </span>
-              <span className="ml-auto text-sm text-muted-foreground">
-                {days === null && t(paid ? "clientMarket.listing.noTrial" : "clientMarket.listing.unlimited")}
-              </span>
-              <button
-                type="button"
-                className={textAction}
-                aria-expanded={days !== null}
+          <label className="grid gap-1.5 text-sm font-medium">
+            {t(paid ? "clientMarket.listing.trial" : "clientMarket.listing.freeDays")}
+            <span className={numberField}>
+              <input
+                inputMode="numeric"
+                placeholder={t(paid ? "clientMarket.listing.noTrialPlaceholder" : "clientMarket.listing.unlimitedPlaceholder")}
+                className="w-0 flex-1 bg-transparent font-normal tabular-nums outline-none placeholder:text-muted-foreground/60"
+                value={paid ? draft.trialHours : draft.freeDays}
                 disabled={disabled}
-                onClick={() => setDays(days === null ? "" : null)}
-              >
-                {t(
-                  days === null
-                    ? paid
-                      ? "clientMarket.listing.addTrial"
-                      : "clientMarket.listing.setLimit"
-                    : paid
-                      ? "clientMarket.listing.removeTrial"
-                      : "clientMarket.listing.removeLimit",
-                )}
-              </button>
-            </div>
-            {days !== null ? (
-              <>
-                <div className={numberField}>
-                  <input
-                    required
-                    aria-labelledby={`${idPrefix}-term`}
-                    inputMode="numeric"
-                    placeholder={`1–${maxDays}`}
-                    className="w-0 flex-1 bg-transparent text-sm tabular-nums outline-none"
-                    value={days}
-                    disabled={disabled}
-                    aria-describedby={days && !validDays ? `${idPrefix}-days-error` : undefined}
-                    aria-invalid={!!days && !validDays}
-                    onChange={(event) => setDays(event.target.value)}
-                  />
-                  <span className="text-xs text-muted-foreground">{t("clientMarket.listing.days")}</span>
-                </div>
-                {!!days && !validDays ? (
-                  <p id={`${idPrefix}-days-error`} className="text-xs text-danger">
-                    {t("clientMarket.listing.daysError", { max: maxDays })}
-                  </p>
-                ) : null}
-              </>
+                aria-describedby={term && !validTerm ? `${idPrefix}-term-error` : undefined}
+                aria-invalid={!!term && !validTerm}
+                onChange={(event) => set(paid ? { trialHours: event.target.value } : { freeDays: event.target.value })}
+              />
+              <span className="text-xs font-normal text-muted-foreground">
+                {t(paid ? "clientMarket.listing.hours" : "clientMarket.listing.days")}
+              </span>
+            </span>
+            {term && !validTerm ? (
+              <span id={`${idPrefix}-term-error`} className="text-xs font-normal text-danger">
+                {t("clientMarket.listing.daysError", { max: maxTerm })}
+              </span>
             ) : null}
-          </div>
+          </label>
         </>
       ) : null}
     </div>

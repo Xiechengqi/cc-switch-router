@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { Drawer } from "@heroui/react";
-import { ShieldAlert, UserRound } from "lucide-react";
+import { UserRound } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ClientOnlineHeatmap } from "@/components/dashboard/client-online-heatmap";
 import { drawerDialogClassName } from "@/components/dashboard/share-dashboard-utils";
@@ -41,30 +41,8 @@ import {
   useListingPrice,
 } from "./online-shop";
 
-const RISK_NOTICE_KEY = "cc_switch_router_client_market_risk_notice_v1";
-
 function updateMarketSearch(update: (params: URLSearchParams) => void) {
   window.history.replaceState(null, "", currentPageHref(window.location.href, update));
-}
-
-/** One-time, dismissible reminder that the seller's machine runs the Client. */
-function RiskNotice() {
-  const { t } = useLocaleText();
-  const [dismissed, setDismissed, hydrated] = usePersistentState<boolean>(RISK_NOTICE_KEY, false);
-  if (!hydrated || dismissed) return null;
-  return (
-    <div role="note" className="flex min-w-0 items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
-      <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden />
-      <p className="min-w-0 flex-1 leading-6">{t("clientMarket.risk.notice")}</p>
-      <button
-        type="button"
-        className="h-9 shrink-0 rounded-lg px-2 text-xs font-medium text-amber-900 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        onClick={() => setDismissed(true)}
-      >
-        {t("clientMarket.risk.dismiss")}
-      </button>
-    </div>
-  );
 }
 
 export function ShopCatalog({
@@ -76,6 +54,7 @@ export function ShopCatalog({
   terminations,
   onTerminationOpen,
   providerNotice,
+  mine,
 }: {
   listings: OnlineListing[];
   loaded: boolean;
@@ -85,6 +64,11 @@ export function ShopCatalog({
   terminations: ReadonlyMap<string, ClientTerminationHostSummary>;
   onTerminationOpen: (id: string) => void;
   providerNotice?: React.ReactNode;
+  /**
+   * The "Mine" tab: while selected, `view` (the buyer's rentals and rental
+   * history) replaces the shop grid. Any region tab leaves it.
+   */
+  mine?: { selected: boolean; enabled: boolean; count: number; onChange: (mine: boolean) => void; view: React.ReactNode };
 }) {
   const { locale, t } = useLocaleText();
   const names = React.useMemo(() => new Intl.DisplayNames([locale], { type: "region" }), [locale]);
@@ -138,6 +122,7 @@ export function ShopCatalog({
   React.useEffect(() => setPage(1), [continent, country, query, rentableOnly]);
 
   const selectCountry = (code: string) => {
+    mine?.onChange(false);
     const next = code === SHOP_UNKNOWN_COUNTRY || /^[A-Z]{2}$/.test(code) ? code : "";
     setLinkCountry(null);
     setBrowse((value) => ({ ...value, country: next, continent: next ? continentOf(next) : value.continent }));
@@ -147,6 +132,7 @@ export function ShopCatalog({
     });
   };
   const selectContinent = (next: ShopContinent) => {
+    mine?.onChange(false);
     setLinkCountry(null);
     setBrowse((value) => ({ ...value, country: "", continent: next }));
     updateMarketSearch((params) => params.delete("country"));
@@ -161,7 +147,6 @@ export function ShopCatalog({
   if (!loaded) return <p role="status" className="py-10 text-center text-sm text-muted-foreground">{t("common.loading")}</p>;
   return (
     <div className="grid min-w-0 gap-4">
-      <RiskNotice />
       {providerNotice}
       <ClientShopFilters
         cards={cards}
@@ -176,8 +161,22 @@ export function ShopCatalog({
           label: t("clientMarket.shop.onlyRentable"),
           onClick: () => setBrowse((value) => ({ ...value, rentableOnly: !rentableOnly })),
         }}
+        mine={
+          mine
+            ? {
+                selected: mine.selected,
+                enabled: mine.enabled,
+                count: mine.count,
+                label: t("shareMarket.catalog.mine"),
+                hint: t(mine.selected || mine.enabled ? "clientMarket.catalog.mineHint" : "clientMarket.catalog.mineDisabledHint"),
+                onSelect: () => mine.onChange(true),
+              }
+            : undefined
+        }
       />
-      {shown.length === 0 ? (
+      {mine?.selected ? (
+        mine.view
+      ) : shown.length === 0 ? (
         <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground">
           <p>
             {t(
@@ -297,7 +296,6 @@ function ClientDetailDrawer({
                     ) : null}
                   </section>
                 ) : null}
-                <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">{t("clientMarket.risk.notice")}</p>
               </div>
             ) : null}
           </Drawer.Body>

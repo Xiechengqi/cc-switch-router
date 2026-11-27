@@ -8,6 +8,7 @@ import * as React from "react";
 import Link from "next/link";
 import { Button } from "@heroui/react";
 import { ArrowUpRight, ExternalLink } from "lucide-react";
+import { RentalHistorySection } from "@/components/common/rental-history-section";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
 import { AccountSectionError } from "@/components/dashboard/account-section";
 import { MarketServiceDisputeControl } from "@/components/dashboard/market-service-dispute-control";
@@ -382,8 +383,7 @@ export function AccountShareRentals({
           )}
         />
       </section> : null}
-      <section className="grid min-w-0 gap-2" aria-labelledby="account-share-rentals-history">
-        <h4 id="account-share-rentals-history" className="text-sm font-semibold text-muted-foreground">{t("account.share.history")} · {historyCount}</h4>
+      <RentalHistorySection id="account-share-rentals-history" title={t("account.share.history")} count={historyCount}>
         <ExpandableRecordTable rows={pagedHistory?.items ?? history} rowKey={(item) => item.id} rowLabel={rentalShareLabel}
           columns={columns.filter((column) => column.id !== "open")}
           ariaLabel={t("account.share.history")} focusKey={focusId}
@@ -391,7 +391,7 @@ export function AccountShareRentals({
           empty={<p className="text-sm text-muted-foreground">{t("account.share.historyEmpty")}</p>} />
         {pagedHistory ? <MarketPagination page={pagedHistory.page} pageCount={pagedHistory.pageCount} onPageChange={changeHistoryPage} />
           : nextCursor && onLoadMore ? <Button variant="ghost" className="min-h-11 justify-self-start" isDisabled={loadingMore} onPress={() => void onLoadMore()}>{t(loadingMore ? "common.loading" : "marketWallet.more")}</Button> : null}
-      </section>
+      </RentalHistorySection>
       {rentals.dialog}
     </div>
   );

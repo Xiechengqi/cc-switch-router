@@ -16,7 +16,7 @@ export type OnlineListing = {
   owned: boolean;
   cyclePriceMinor: number;
   freeDays: number | null;
-  trialDays: number;
+  trialHours: number;
   country: string | null;
   egressIp: string | null;
   egressDiffers: boolean;
@@ -231,7 +231,7 @@ export function getOnlineListings(signal?: AbortSignal) {
 export type ListingTermsPayload = {
   cyclePriceMinor: number;
   freeDays: number | null;
-  trialDays: number;
+  trialHours: number;
   title: string | null;
 };
 

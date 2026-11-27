@@ -76,7 +76,7 @@ try {
       [{id:"current-lease",listingId:record.hostId,label:"Online rental fixture",state:"active",cyclePriceMinor:100,tenantEmail:"new-tenant@example.test",expiresAt:null,terminationId:null}]:[]});
     if (path === "/v1/client-market/online/listings") return json(route,{listings:hostPresent ? [{
       installationId:record.hostId, providerId:"provider", label:"Online rental fixture", revision:1,state:"listed",owned:actor === "provider",
-      cyclePriceMinor:100,freeDays:null,trialDays:0,country:"JP",egressIp:null,egressDiffers:false,
+      cyclePriceMinor:100,freeDays:null,trialHours:0,country:"JP",egressIp:null,egressDiffers:false,
       healthy:true,occupied:true,observedAt:Math.floor(Date.now()/1000),availability:"occupied",exclusiveManagement:true,
     }] : []});
     if (path === "/v1/client-market/me/rentals") return json(route, emptyClientRentalsPage(url));

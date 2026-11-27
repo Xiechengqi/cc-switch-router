@@ -3,7 +3,8 @@
  * The Client market page body. It reads the listings (and, for sellers, the
  * seller inventory) and composes the pieces:
  *   - MyClientRentals: the buyer's running rentals, on top;
- *   - ShopCatalog + useClientCheckout: browse and rent;
+ *   - ShopCatalog + useClientCheckout: browse and rent. Its "Mine" tab swaps
+ *     the shop for the buyer's rentals and their rental history;
  *   - SellerWorkspace: listed, rented out and past rentals;
  *   - ClientRentalAuditPanel: the Router owner's audit of every rental.
  * After an order the buyer stays here and the new rental card is highlighted.
@@ -19,6 +20,7 @@ import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { getClientRentals } from "@/lib/client-rentals";
 import { getClientSellerSummary, type ClientSellerSummary } from "@/lib/client-seller-summary";
 import type { ClientTerminationHostSummary } from "@/lib/client-termination";
 import {
@@ -31,11 +33,38 @@ import { currentPageHref } from "@/lib/url-search";
 import { useClientCheckout } from "./client-checkout";
 import { clientMarketWorkspaceFromQuery, type ClientMarketWorkspace } from "./host-utils";
 import { MyClientRentals } from "./my-rentals";
+import { ClientRentalRecords } from "./rental-records";
 import { ClientRentalAuditPanel } from "./rental-audit-panel";
 import { SellerWorkspace } from "./seller-workspace";
 import { ShopCatalog } from "./shop-catalog";
 
 const LISTING_POLL_MS = 15_000;
+
+/**
+ * How many Clients the buyer rents now and has rented before. It decides
+ * whether "Mine" can be picked; null for guests and until the first answer.
+ */
+function useClientRentalCounts(authenticated: boolean, revision: number) {
+  const [counts, setCounts] = React.useState<{ current: number; history: number } | null>(null);
+  React.useEffect(() => {
+    if (!authenticated) {
+      setCounts(null);
+      return;
+    }
+    const control = new AbortController();
+    void Promise.all([
+      getClientRentals("current", 1, null, control.signal),
+      getClientRentals("history", 1, null, control.signal),
+    ])
+      .then(([current, history]) => {
+        if (!control.signal.aborted) setCounts({ current: current.total, history: history.total });
+      })
+      // A failed count keeps the last answer; it only gates the tab.
+      .catch(() => undefined);
+    return () => control.abort();
+  }, [authenticated, revision]);
+  return counts;
+}
 
 // Keep the workspace and seller views shareable.
 function updateMarketSearch(update: (params: URLSearchParams) => void) {
@@ -92,6 +121,11 @@ function OnlineMarketView({
   const [rentalRevision, setRentalRevision] = React.useState(0);
   const [newLease, setNewLease] = React.useState<string | null>(null);
   const reload = React.useCallback(() => setVersion((value) => value + 1), []);
+  const [mineSelected, setMineSelected] = React.useState(false);
+  const rentalCounts = useClientRentalCounts(authenticated, rentalRevision + version);
+  const mineEnabled = authenticated && !!rentalCounts && rentalCounts.current + rentalCounts.history > 0;
+  // Until the counts arrive, a chosen "Mine" stays; a known-empty one falls back.
+  const mine = mineSelected && authenticated && (rentalCounts === null || mineEnabled);
 
   // Until the summary arrives, a seller's link to "My listings" keeps the tab,
   // so the page neither flickers nor drops the seller back to the catalog.
@@ -241,7 +275,7 @@ function OnlineMarketView({
         />
       ) : (
         <>
-          {authenticated ? (
+          {authenticated && !mine ? (
             <MyClientRentals revision={rentalRevision} highlightId={newLease} onTerminationOpen={onTerminationOpen} />
           ) : null}
           <ShopCatalog
@@ -253,6 +287,25 @@ function OnlineMarketView({
             terminations={terminations}
             onTerminationOpen={onTerminationOpen}
             providerNotice={providerNotice}
+            mine={{
+              selected: mine,
+              enabled: mineEnabled,
+              count: rentalCounts?.current ?? 0,
+              onChange: setMineSelected,
+              view: (
+                <div className="grid min-w-0 gap-5">
+                  {rentalCounts?.current === 0 ? (
+                    <p className="rounded-md border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500">
+                      {t("clientMarket.mine.none")}
+                    </p>
+                  ) : (
+                    <MyClientRentals revision={rentalRevision} highlightId={newLease} onTerminationOpen={onTerminationOpen} />
+                  )}
+                  {/* Rental history shows only under "Mine", like the Share catalog. */}
+                  <ClientRentalRecords historyOnly revision={rentalRevision} onTerminationOpen={onTerminationOpen} />
+                </div>
+              ),
+            }}
           />
         </>
       )}

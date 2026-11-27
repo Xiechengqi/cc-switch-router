@@ -239,7 +239,7 @@ struct Offer {
     cycle_price_minor: i64,
     free_days: Option<u32>,
     #[serde(default)]
-    trial_days: u32,
+    trial_hours: u32,
     #[serde(default)]
     title: Option<String>,
     acknowledged: bool,
@@ -622,7 +622,7 @@ async fn list(
             "invalid Client rental terms or missing acknowledgement".into(),
         ));
     }
-    seller::validate_terms(v.cycle_price_minor, v.free_days, v.trial_days)?;
+    seller::validate_terms(v.cycle_price_minor, v.free_days, v.trial_hours)?;
     let title = seller::normalize_title(v.title.as_deref())?;
     if s.proxy
         .active_client_route_for_installation(&id)
@@ -639,12 +639,12 @@ async fn list(
     {
         let c = s.store.conn.lock().await;
         let tx = listing_provider_transaction(&c, &id, &a, v.cycle_price_minor > 0)?;
-        let changed=tx.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,free_days,trial_days,title,updated_at,challenge,challenge_until)
+        let changed=tx.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,free_days,trial_hours,title,updated_at,challenge,challenge_until)
             VALUES(?1,?2,lower(?3),'locking',1,1,?4,?5,?6,?8,unixepoch(),?7,unixepoch()+30)
             ON CONFLICT(installation_id) DO UPDATE SET state='locking',revision=revision+1,sequence=sequence+1,seller_id=excluded.seller_id,owner_email=excluded.owner_email,
-            cycle_price_minor=excluded.cycle_price_minor,free_days=excluded.free_days,trial_days=excluded.trial_days,title=excluded.title,paused_at=NULL,challenge=excluded.challenge,challenge_until=excluded.challenge_until,egress_ip=NULL,country_code=NULL,check_json=NULL,healthy=0,egress_checked_at=NULL,unlist_pending=0,unlisted_at=NULL
+            cycle_price_minor=excluded.cycle_price_minor,free_days=excluded.free_days,trial_hours=excluded.trial_hours,title=excluded.title,paused_at=NULL,challenge=excluded.challenge,challenge_until=excluded.challenge_until,egress_ip=NULL,country_code=NULL,check_json=NULL,healthy=0,egress_checked_at=NULL,unlist_pending=0,unlisted_at=NULL
             WHERE state='unlisted' OR (state='locking' AND challenge_until<unixepoch() AND check_json IS NULL)",
-            params![id,a.user_id,a.email,v.cycle_price_minor,v.free_days,v.trial_days,challenge,title]).market()?;
+            params![id,a.user_id,a.email,v.cycle_price_minor,v.free_days,v.trial_hours,challenge,title]).market()?;
         if changed != 1 {
             return Err(ListingBlocker::AlreadyListed.error());
         }
@@ -808,7 +808,7 @@ fn buyable(
 ) -> Result<Terms, AppError> {
     let (seller, listing_price, days, trial, owner_capable): (String, i64, Option<u32>, i64, bool) =
         tx.query_row(
-            "SELECT seller_id,cycle_price_minor,free_days,trial_days*86400,owner_rental
+            "SELECT seller_id,cycle_price_minor,free_days,trial_hours*3600,owner_rental
                FROM online_client_supply
               WHERE installation_id=?1 AND revision=?2 AND availability='available'",
             params![id, revision],
@@ -1195,7 +1195,7 @@ async fn listings(
         .then(|| legacy_available_hours(&c, me.as_deref()))
         .transpose()?;
     let mut stmt = c.prepare(
-        "SELECT l.installation_id, l.revision, l.state, l.cycle_price_minor, l.free_days, l.trial_days,
+        "SELECT l.installation_id, l.revision, l.state, l.cycle_price_minor, l.free_days, l.trial_hours,
                 l.country_code, l.egress_ip, l.check_json, l.probe_healthy, l.observed_at, l.seller_id IS ?1,
                 l.occupied, t.subdomain, coalesce(i.last_seen_ip!=l.egress_ip,0), mp.id,
                 l.probe_error, o.delivery_attempts, i.created_at, l.availability, l.exclusive_management, l.owner_rental,
@@ -1223,7 +1223,7 @@ async fn listings(
         let mut item = json!({
             "installationId": installation, "revision": r.get::<_, i64>(1)?, "state": r.get::<_, String>(2)?,
             "cyclePriceMinor": r.get::<_, i64>(3)?, "freeDays": r.get::<_, Option<i64>>(4)?,
-            "trialDays": r.get::<_, i64>(5)?, "country": r.get::<_, Option<String>>(6)?,
+            "trialHours": r.get::<_, i64>(5)?, "country": r.get::<_, Option<String>>(6)?,
             "egressIp": crate::store::visible_host_ip(r.get(7)?, owned), "egressDiffers": r.get::<_, bool>(14)?,
             "hardware": check["hardware"], "healthy": r.get::<_, bool>(9)?, "observedAt": r.get::<_, Option<i64>>(10)?,
             "owned": owned, "occupied": r.get::<_, bool>(12)?, "label": label,

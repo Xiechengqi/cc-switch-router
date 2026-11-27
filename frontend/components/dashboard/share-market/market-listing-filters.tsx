@@ -68,30 +68,52 @@ export function MarketListingFilters({
       {leading}
       <div className="flex min-w-0 flex-1 basis-full items-center gap-1 overflow-x-auto sm:basis-auto" role="tablist" aria-label={t("shareMarket.catalog.familyFilter")}>
         {showMine ? (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mine}
-            title={t("shareMarket.catalog.mineHint")}
-            disabled={!mine && !mineEnabled}
-            className={cn(
-              "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
-              mine
-                ? "bg-sky-100 font-semibold text-sky-800"
-                : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
-              !mine && !mineEnabled ? "cursor-not-allowed opacity-50 hover:bg-slate-100 hover:text-slate-600" : null,
-            )}
-            onClick={() => {
-              if (mine) onMineChange(false);
-              else if (mineEnabled) onMineChange(true);
-            }}
-          >
-            <span>{t("shareMarket.catalog.mine")}</span>
-            <span className={cn("tabular-nums", mine ? "text-sky-600" : "text-slate-400")}>{mineCount}</span>
-          </button>
+          // "Mine" and "All" lead the provider tabs and the three are one choice:
+          // picking a provider leaves "Mine", picking "Mine" clears the provider.
+          <>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mine}
+              title={mine || mineEnabled ? t("shareMarket.catalog.mineHint") : t("shareMarket.catalog.mineDisabledHint")}
+              disabled={!mine && !mineEnabled}
+              className={cn(
+                "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+                mine
+                  ? "bg-sky-100 font-semibold text-sky-800"
+                  : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
+                !mine && !mineEnabled ? "cursor-not-allowed opacity-50 hover:bg-slate-100 hover:text-slate-600" : null,
+              )}
+              onClick={() => {
+                if (mine || !mineEnabled) return;
+                onMineChange(true);
+                onFamilyChange("all");
+              }}
+            >
+              <span>{t("shareMarket.catalog.mine")}</span>
+              {mineCount ? <span className={cn("tabular-nums", mine ? "text-sky-600" : "text-slate-400")}>{mineCount}</span> : null}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={!mine && family === "all"}
+              className={cn(
+                "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+                !mine && family === "all"
+                  ? "bg-sky-100 font-semibold text-sky-800"
+                  : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
+              )}
+              onClick={() => {
+                onMineChange(false);
+                onFamilyChange("all");
+              }}
+            >
+              {t("shareMarket.catalog.all")}
+            </button>
+          </>
         ) : null}
         {familyTabs.map((item) => {
-          const selectedFamily = family === item.value;
+          const selectedFamily = !mine && family === item.value;
           return (
             <button
               key={item.value}
@@ -105,7 +127,10 @@ export function MarketListingFilters({
                   ? "bg-sky-100 font-semibold text-sky-800"
                   : "bg-slate-100 font-medium text-slate-600 hover:bg-slate-200 hover:text-slate-900",
               )}
-              onClick={() => onFamilyChange(selectedFamily ? "all" : item.value)}
+              onClick={() => {
+                if (mine) onMineChange?.(false);
+                onFamilyChange(selectedFamily ? "all" : item.value);
+              }}
             >
               <span>{providerCategoryLabel(item.value, locale)}</span>
               <span className={cn("tabular-nums", selectedFamily ? "text-sky-600" : "text-slate-400")}>{item.idle}</span>

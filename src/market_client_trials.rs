@@ -107,7 +107,7 @@ pub(crate) fn for_contract_tx(
     };
     let hours: i64 = conn
         .query_row(
-            "SELECT COALESCE(h.trial_days*24,p.client_hours) FROM market_trial_policy p
+            "SELECT COALESCE(h.trial_hours,p.client_hours) FROM market_trial_policy p
          LEFT JOIN online_client_listings h ON h.installation_id=?1 WHERE p.id=1",
             params![host],
             |r| r.get(0),

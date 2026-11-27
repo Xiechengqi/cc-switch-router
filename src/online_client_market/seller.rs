@@ -42,13 +42,13 @@ fn looks_like_contact(title: &str) -> bool {
 pub(super) fn validate_terms(
     price: i64,
     free_days: Option<u32>,
-    trial_days: u32,
+    trial_hours: u32,
 ) -> Result<(), AppError> {
     if !(0..=100_000_000).contains(&price)
         || free_days.is_some_and(|n| !(1..=365).contains(&n))
-        || trial_days > 30
+        || i64::from(trial_hours) > crate::market_trial_policy::MAX_HOURS
         || price > 0 && free_days.is_some()
-        || price == 0 && trial_days != 0
+        || price == 0 && trial_hours != 0
     {
         return Err(AppError::BadRequest("invalid Client rental terms".into()));
     }
@@ -399,7 +399,7 @@ pub(super) struct ListingUpdate {
     cycle_price_minor: i64,
     free_days: Option<u32>,
     #[serde(default)]
-    trial_days: u32,
+    trial_hours: u32,
     #[serde(default)]
     title: Option<String>,
 }
@@ -412,7 +412,7 @@ pub(super) async fn update_listing(
     Json(v): Json<ListingUpdate>,
 ) -> Reply {
     let a = actor(&s, &h).await?;
-    validate_terms(v.cycle_price_minor, v.free_days, v.trial_days)?;
+    validate_terms(v.cycle_price_minor, v.free_days, v.trial_hours)?;
     let title = normalize_title(v.title.as_deref())?;
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
@@ -424,7 +424,7 @@ pub(super) async fn update_listing(
     };
     let current: (i64, Option<u32>, u32) = tx
         .query_row(
-            "SELECT cycle_price_minor,free_days,trial_days FROM online_client_listings
+            "SELECT cycle_price_minor,free_days,trial_hours FROM online_client_listings
              WHERE installation_id=?1 AND seller_id=?2 AND state='listed'",
             params![id, a.user_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -432,12 +432,12 @@ pub(super) async fn update_listing(
         .optional()
         .market()?
         .ok_or_else(|| conflict("only a listed Client can change its offer"))?;
-    let terms_changed = current != (v.cycle_price_minor, v.free_days, v.trial_days);
+    let terms_changed = current != (v.cycle_price_minor, v.free_days, v.trial_hours);
     tx.execute(
-        "UPDATE online_client_listings SET cycle_price_minor=?3,free_days=?4,trial_days=?5,title=?6,
+        "UPDATE online_client_listings SET cycle_price_minor=?3,free_days=?4,trial_hours=?5,title=?6,
              revision=revision+?7,updated_at=unixepoch()
          WHERE installation_id=?1 AND seller_id=?2 AND state='listed'",
-        params![id, a.user_id, v.cycle_price_minor, v.free_days, v.trial_days, title, i64::from(terms_changed)],
+        params![id, a.user_id, v.cycle_price_minor, v.free_days, v.trial_hours, title, i64::from(terms_changed)],
     )
     .market()?;
     tx.commit().market()?;

@@ -29,6 +29,7 @@ import {
 import { expiryTitle } from "@/components/dashboard/share-dashboard-utils";
 import { filterMarketListings } from "@/components/dashboard/share-market/buyer-catalog-utils";
 import { MarketListingFilters } from "@/components/dashboard/share-market/market-listing-filters";
+import { ShareSellerRentalHistory } from "@/components/dashboard/share-market/seller-rental-history";
 import { MarketShareIdentity, OwnedShareOptionIdentity } from "@/components/dashboard/share-market/market-share-identity";
 import {
   CatalogSeatPreviewList,
@@ -1756,6 +1757,10 @@ export function ShareMarketOwnerWorkspace({
                   </div>
                 </section>
               ) : null}
+
+              <ShareSellerRentalHistory
+                revision={listings.map((listing) => listing.seats.map((seat) => seat.subscription?.id ?? "").join(",")).join("|")}
+              />
             </>
           )}
 

@@ -7,7 +7,7 @@
  */
 import * as React from "react";
 import Link from "next/link";
-import { Check, Copy, ExternalLink, Loader2, ShieldAlert, TriangleAlert } from "lucide-react";
+import { Check, Copy, ExternalLink, Loader2, TriangleAlert } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { trialDuration } from "@/lib/client-checkout";
@@ -361,12 +361,6 @@ function Onboarding({
     {
       id: "account",
       label: t("clientMarket.onboarding.account"),
-      hint: (
-        <span className="flex gap-1.5 text-amber-900">
-          <ShieldAlert className="mt-0.5 size-3.5 shrink-0 text-amber-600" aria-hidden />
-          {t("clientMarket.risk.notice")}
-        </span>
-      ),
       checked: !!done.account,
     },
     {

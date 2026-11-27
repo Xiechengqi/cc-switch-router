@@ -18,6 +18,7 @@ use crate::db::{Connection, OptionalExtension, params, types::Value as SqlValue}
 use crate::error::AppError;
 
 mod detail;
+mod seller;
 #[cfg(test)]
 mod tests;
 
@@ -49,6 +50,7 @@ pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/admin/share-market/rental-audit", get(list))
         .route("/v1/admin/share-market/rental-audit/:id", get(detail::get))
+        .route("/v1/share-market/me/rental-history", get(seller::list))
         .layer(axum::middleware::from_fn(private_response))
 }
 

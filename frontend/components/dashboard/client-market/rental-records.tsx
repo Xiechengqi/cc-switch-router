@@ -7,6 +7,7 @@ import { Button } from "@heroui/react";
 import { ChevronDown, ChevronLeft, ChevronRight, Loader2, MessageCircle, TriangleAlert } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
+import { RentalHistorySection } from "@/components/common/rental-history-section";
 import { ExpandableRecordTable, RecordDetailList, type RecordTableColumn } from "@/components/common/expandable-record-table";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
@@ -131,8 +132,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
       { id: "term", header: t("account.market.col.term"), minWidth: "lg" as const, className: "w-40", cell: (row: ClientRentalRecord) => <span className="text-muted-foreground">{date(row.periodEnd || row.expiresAt)}</span> },
     ]),
   ];
-  return <section className="grid min-w-0 gap-2" aria-labelledby={titleId} data-testid={`client-rentals-${view}`}>
-    <h4 id={titleId} className="text-sm font-semibold text-muted-foreground">{t(view === "current" ? "clientRentals.current" : "clientRentals.history")}{page ? <span className="ml-1.5 tabular-nums">· {page.total}</span> : null}</h4>
+  return <RentalHistorySection id={titleId} title={t(view === "current" ? "clientRentals.current" : "clientRentals.history")} count={page?.total} testId={`client-rentals-${view}`}>
     {failed ? <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{t("clientRentals.error")}<Button size="sm" variant="ghost" onPress={() => void load(canonicalPage.current)}>{t("common.retry")}</Button></div> : null}
     {busy ? <p role="status" className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 aria-hidden className="h-4 w-4 animate-spin" />{t("common.loading")}</p> : page ? <ExpandableRecordTable
       rows={page.items} rowKey={row => row.id} rowLabel={clientRentalLabel} columns={columns}
@@ -140,7 +140,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
       rowTone={row => row.cleanupStatus === "failed" ? "danger" : row.attention !== "none" ? "attention" : undefined}
       onExpandedChange={setExpanded}
       renderDetail={row => <RentalDetail key={row.id} id={row.id} refreshKey={JSON.stringify([row.status, row.attention, row.cleanupStatus, row.money, row.periodEnd, row.renewalPolicy])} onChanged={onChanged} onTerminationOpen={onTerminationOpen} onForbidden={revokeAccess} />}
-      empty={<p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t(view === "current" ? "clientRentals.currentEmpty" : "clientRentals.historyEmpty")}{view === "current" ? <Link href={DASHBOARD_CLIENT_MARKET_PATH} className="ml-2 text-accent hover:underline">{t("account.client.openMarket")}</Link> : null}</p>}
+      empty={view === "history" ? <p className="text-sm text-muted-foreground">{t("clientRentals.historyEmpty")}</p> : <p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t("clientRentals.currentEmpty")}<Link href={DASHBOARD_CLIENT_MARKET_PATH} className="ml-2 text-accent hover:underline">{t("account.client.openMarket")}</Link></p>}
     /> : null}
     {page && page.total > 0 ? <nav className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground" aria-label={t("clientRentals.pagination")}>
       <span className="tabular-nums">{t("clientRentals.count", { count: page.total, page: page.page, pages: page.totalPages })}</span>
@@ -148,7 +148,7 @@ function RentalSection({ view, focusKey, revision, onChanged, onTerminationOpen 
       <form className="flex items-center gap-1" onSubmit={event => { event.preventDefault(); const next = parseAuditPageNumber(jump, page.totalPages); setInvalidJump(next === null); if (next !== null) changePage(next); }}><label htmlFor={jumpId} className="sr-only">{t("rentalAudit.pageNumber")}</label><input id={jumpId} inputMode="numeric" maxLength={10} value={jump} disabled={busy} aria-invalid={invalidJump} aria-describedby={invalidJump ? `${jumpId}-error` : undefined} className="h-9 w-14 min-w-0 rounded-md border border-border bg-card px-2 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring" onChange={e => { setJump(e.target.value); setInvalidJump(false); }} /><Button size="sm" variant="outline" type="submit" isDisabled={busy}>{t("rentalAudit.jump")}</Button></form></div>
       {invalidJump ? <p id={`${jumpId}-error`} role="alert" className="w-full text-destructive">{t("rentalAudit.invalidPage", { pages: page.totalPages })}</p> : null}
     </nav> : null}
-  </section>;
+  </RentalHistorySection>;
 }
 
 function RentalDetail({ id, refreshKey, onChanged, onTerminationOpen, onForbidden }: {

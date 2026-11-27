@@ -348,6 +348,7 @@ export function ShareMarketBuyerCatalog({
     () => partitionShareMarketSubscriptions(subscriptions),
     [subscriptions],
   );
+  const historyCount = Math.max(historyTotal ?? 0, history.length);
 
   React.useEffect(() => {
     setPage((current) => Math.min(current, paged.pageCount));
@@ -465,10 +466,12 @@ export function ShareMarketBuyerCatalog({
         onFamilyChange={setFamily}
         onQueryChange={setQuery}
         onOwnersChange={setOwners}
-        mine={mine}
+        mine={authed && mine}
         mineCount={rentedShareIds.size}
-        mineEnabled={authed && rentedShareIds.size > 0}
-        onMineChange={authed ? setMine : undefined}
+        // "Mine" needs a signed-in buyer with something to show: a running rental
+        // or at least one finished one (its history is what "Mine" adds below).
+        mineEnabled={authed && (rentedShareIds.size > 0 || historyCount > 0)}
+        onMineChange={setMine}
         idleOnly={idleOnly}
         onIdleOnlyChange={setIdleOnly}
         sort={sort}
@@ -503,7 +506,7 @@ export function ShareMarketBuyerCatalog({
         </div>
       ) : null}
       <MarketPagination page={paged.page} pageCount={paged.pageCount} onPageChange={setPage} />
-      {authed ? (
+      {authed && mine ? (
         <AccountShareRentals
           historyOnly
           historyPageSize={5}
