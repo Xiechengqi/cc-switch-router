@@ -81,7 +81,9 @@ export function ClientShopFilters({
   const priceOf = (card: ShopCountryCard) =>
     card.hasFreeIdle || card.minMonthlyMinor == null ? t("online.free") : formatUsdMoney(card.minMonthlyMinor, locale);
   const inContinent = (value: ShopContinent) => (value === "all" ? cards : cards.filter((card) => card.continent === value));
-  const idle = (list: ShopCountryCard[]) => list.reduce((sum, card) => sum + card.idle, 0);
+  // Counts follow the list on screen: every listed Client, or only the
+  // rentable ones while "rentable only" is on (`cards` is built from that pool).
+  const shown = (list: ShopCountryCard[]) => list.reduce((sum, card) => sum + card.total, 0);
   const countries = inContinent(continent);
   return (
     <div className="grid min-w-0 gap-2">
@@ -120,7 +122,7 @@ export function ClientShopFilters({
                 onClick={() => onContinent(selected ? "all" : value)}
               >
                 <span>{t(`clientMarket.shop.continent.${value}`)}</span>
-                <span className={shopChipCount(selected)}>{idle(members)}</span>
+                <span className={shopChipCount(selected)}>{shown(members)}</span>
               </button>
             );
           })}
@@ -182,7 +184,7 @@ export function ClientShopFilters({
               >
                 {known ? <CountryFlag code={card.code} size="compact" title={name} /> : <Globe2 className="size-3.5" aria-hidden />}
                 <span className="max-w-32 truncate">{name}</span>
-                <span className={shopChipCount(selected)}>{card.idle}</span>
+                <span className={shopChipCount(selected)}>{card.total}</span>
               </button>
             );
           })}

@@ -125,3 +125,13 @@ test("Share catalog: All sits right of Mine, history only under Mine, seller his
   assert.match(buyer, /\{authed && mine \? \(\s*<AccountShareRentals\s+historyOnly/);
   assert.match(read("../share-market/owner-workspace.tsx"), /<ShareSellerRentalHistory\b/);
 });
+
+test("continent and country counts follow the listings on screen, rented ones included unless rentable-only is on", () => {
+  const shop = readFileSync(new URL("./online-shop.tsx", import.meta.url), "utf8");
+  const catalog = readFileSync(new URL("./shop-catalog.tsx", import.meta.url), "utf8");
+  // The cards come from the pool the toggle filters, so `total` is what the list shows.
+  assert.match(catalog, /const pool = listed\.filter\(\(item\) => !rentableOnly \|\| onlineListingRentable\(item\)\);\s*const cards = sortShopCountries\(aggregateOnlineShopCountries\(pool\)/);
+  assert.match(shop, /list\.reduce\(\(sum, card\) => sum \+ card\.total, 0\)/);
+  assert.match(shop, /<span className=\{shopChipCount\(selected\)\}>\{card\.total\}<\/span>/);
+  assert.doesNotMatch(shop, /\{card\.idle\}<\/span>|sum \+ card\.idle/);
+});
