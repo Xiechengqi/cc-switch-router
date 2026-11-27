@@ -44789,6 +44789,17 @@ pub(crate) mod tests {
         };
         {
             let c = store.conn.lock().await;
+            let retired_tables: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('provisioning_jobs','subdomain_reservations')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                retired_tables, 0,
+                "recovery must use the migrated schema after SSH provisioning was retired"
+            );
             let unique: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='idx_installations_public_key_unique' AND sql LIKE 'CREATE UNIQUE INDEX%'", [], |r|r.get(0)).unwrap();
             assert_eq!(
                 unique, 1,

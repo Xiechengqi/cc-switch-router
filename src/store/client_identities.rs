@@ -197,6 +197,8 @@ fn prepare_recovery(
             serde_json::json!({}),
         ));
     }
+    // Migration 127 physically removed SSH provisioning. Check obligations in
+    // the current Online Client schema; retired tables must not be queried.
     let blocked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM installation_fences WHERE public_key=?3 OR installation_id IN (?1,?2))
         OR EXISTS(SELECT 1 FROM client_identities WHERE installation_id=?1)
         OR EXISTS(SELECT 1 FROM client_identity_aliases WHERE previous_installation_id IN (?1,?2) OR installation_id IN (?1,?2))
@@ -210,8 +212,6 @@ fn prepare_recovery(
         OR EXISTS(SELECT 1 FROM online_client_operations WHERE installation_id IN (?1,?2))
         OR EXISTS(SELECT 1 FROM installation_upgrade_tasks WHERE installation_id=?2)
         OR EXISTS(SELECT 1 FROM share_value_owner_model_prices WHERE installation_id=?2)
-        OR EXISTS(SELECT 1 FROM provisioning_jobs WHERE installation_id IN (?1,?2))
-        OR EXISTS(SELECT 1 FROM subdomain_reservations WHERE installation_id IN (?1,?2))
         OR EXISTS(SELECT 1 FROM share_market_listings WHERE installation_id=?2)
         OR EXISTS(SELECT 1 FROM share_request_logs WHERE installation_id=?2)
         OR EXISTS(SELECT 1 FROM image_generation_jobs WHERE installation_id=?2)

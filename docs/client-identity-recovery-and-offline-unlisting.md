@@ -114,3 +114,9 @@ Server 同步修复：本地初始化标记不随 Router claim 失败回退；�
 - Server Web TypeScript、Provider Phase 0 生成/检查、Provider coverage、UI Provider matrix、Web runtime/产品边界/i18n 及文档索引审计通过；Router Share 模型健康契约审计通过。
 - 本次修改文件的 Rust 格式及两仓 diff 空白检查通过。Server 全部 Rust 格式检查通过；Router 全仓格式检查在本次范围外的 `src/online_client_seller_summary.rs`、`src/schema.rs`、`src/share_market_audit/tests.rs` 报告既有格式差异，未改动这些文件。
 - 恢复准备脚本仅作 AST 语法检查；新增 CI 过滤器通过源码核对，均匹配实际测试声明。未运行准备工具、运行类测试、UI 测试、服务、部署或生产恢复 API。
+
+## GitHub Actions 后续修复
+
+提交 `8dc9929` 的 [Actions 45972127168](https://github.com/Xiechengqi/cc-switch-router/actions/runs/45972127168) 中，前端、发布包编译和普通身份恢复用例通过，历史身份恢复用例在首次预检报 `no such table: provisioning_jobs`，发布因此被阻止。原因是本轮预检误加入了 `provisioning_jobs`、`subdomain_reservations` 两张已由迁移 127 物理删除的 SSH 供给旧表，前次静态 review 漏掉了此处迁移边界；这也会阻止真实恢复接口，不是 CI 环境缺表。
+
+删除这两项旧依赖，继续校验现行 `online_client_*`、租约、财务/清理、Share、命名空间、fencing 和外键义务。不能创建空旧表绕过、修改已发布迁移，或把数据库异常当作无业务义务。现有历史恢复用例明确断言旧表不存在，然后覆盖预检、应用、回滚和幂等全链路；本地仅编译与源码检查，执行结果以自动 CI 为准。
