@@ -1937,6 +1937,7 @@ async fn dashboard(
             &state.proxy,
             viewer_email.as_deref(),
             session.as_ref().map(|a| a.user_id.as_str()),
+            viewer_is_admin,
         )
         .await?;
     let snapshot = state.recent_traffic.snapshot().await;

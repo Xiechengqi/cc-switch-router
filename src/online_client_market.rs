@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod reconcile;
 pub(crate) use reconcile::run;
+mod seller;
 mod shares;
 mod upgrades;
 pub(crate) use shares::{
@@ -64,7 +65,15 @@ pub fn router() -> Router<ServerState> {
         )
         .route(
             "/v1/client-market/online/installations/:id/listing",
-            post(list).delete(unlist),
+            post(list).delete(unlist).patch(seller::update_listing),
+        )
+        .route(
+            "/v1/client-market/online/installations/:id/listing/pause",
+            post(seller::pause),
+        )
+        .route(
+            "/v1/client-market/online/installations/:id/listing/resume",
+            post(seller::resume),
         )
         .route(
             "/v1/client-market/online/installations/:id/quote",
@@ -85,6 +94,14 @@ pub fn router() -> Router<ServerState> {
             get(upgrades::status),
         )
         .route("/v1/client-market/online/leases/:id/end", post(end))
+        .route(
+            "/v1/client-market/online/leases/:id/reclaim",
+            post(seller::reclaim),
+        )
+        .route(
+            "/v1/client-market/online/leases/:id/reclaim/cancel",
+            post(seller::cancel_reclaim),
+        )
         .route("/v1/client-market/online/egress/:challenge", post(egress))
         .layer(axum::middleware::from_fn(
             crate::client_market_audit::private_response,
@@ -219,6 +236,8 @@ struct Offer {
     free_days: Option<u32>,
     #[serde(default)]
     trial_days: u32,
+    #[serde(default)]
+    title: Option<String>,
     acknowledged: bool,
 }
 
@@ -422,14 +441,38 @@ fn listing_provider_transaction<'c>(
     if let Some(reason) = readiness(&tx, id, &a.email)?.initial_blocker() {
         return Err(reason.error());
     }
-    let needs_claim = if paid {
-        match paid_listing_blocker(&tx, a)? {
-            None => false,
-            Some(ListingBlocker::ProviderVerification) => true,
-            Some(reason) => return Err(reason.error()),
-        }
-    } else {
-        false
+    if paid {
+        return ensure_paid_provider(c, tx, a);
+    }
+    let now = Utc::now().to_rfc3339();
+    if let crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(conflict) =
+        crate::market_provider_identity::ensure_market_provider_identity_tx(
+            &tx,
+            Some(&a.user_id),
+            &a.email,
+            &now,
+        )?
+    {
+        drop(tx);
+        crate::market_provider_identity::persist_market_provider_identity_conflict(
+            c, &conflict, &now,
+        )?;
+        return Err(ListingBlocker::ProviderConflict.error());
+    }
+    Ok(tx)
+}
+
+/// Paid offers need the seller's provider identity. A first paid offer claims
+/// it here; any other paid blocker (email, paused, conflict) is returned.
+fn ensure_paid_provider<'c>(
+    c: &'c Connection,
+    tx: Transaction<'c>,
+    a: &AuthSession,
+) -> Result<Transaction<'c>, AppError> {
+    let needs_claim = match paid_listing_blocker(&tx, a)? {
+        None => false,
+        Some(ListingBlocker::ProviderVerification) => true,
+        Some(reason) => return Err(reason.error()),
     };
     let now = Utc::now().to_rfc3339();
     if let crate::market_provider_identity::MarketProviderIdentityResolution::Conflict(conflict) =
@@ -565,17 +608,13 @@ async fn list(
     Json(v): Json<Offer>,
 ) -> Reply {
     let a = actor(&s, &h).await?;
-    if !v.acknowledged
-        || !(0..=100_000_000).contains(&v.cycle_price_minor)
-        || v.free_days.is_some_and(|n| !(1..=365).contains(&n))
-        || v.trial_days > 30
-        || v.cycle_price_minor > 0 && v.free_days.is_some()
-        || v.cycle_price_minor == 0 && v.trial_days != 0
-    {
+    if !v.acknowledged {
         return Err(AppError::BadRequest(
             "invalid Client rental terms or missing acknowledgement".into(),
         ));
     }
+    seller::validate_terms(v.cycle_price_minor, v.free_days, v.trial_days)?;
+    let title = seller::normalize_title(v.title.as_deref())?;
     if s.proxy
         .active_client_route_for_installation(&id)
         .await
@@ -591,12 +630,12 @@ async fn list(
     {
         let c = s.store.conn.lock().await;
         let tx = listing_provider_transaction(&c, &id, &a, v.cycle_price_minor > 0)?;
-        let changed=tx.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,free_days,trial_days,updated_at,challenge,challenge_until)
-            VALUES(?1,?2,lower(?3),'locking',1,1,?4,?5,?6,unixepoch(),?7,unixepoch()+30)
+        let changed=tx.execute("INSERT INTO online_client_listings(installation_id,seller_id,owner_email,state,revision,sequence,cycle_price_minor,free_days,trial_days,title,updated_at,challenge,challenge_until)
+            VALUES(?1,?2,lower(?3),'locking',1,1,?4,?5,?6,?8,unixepoch(),?7,unixepoch()+30)
             ON CONFLICT(installation_id) DO UPDATE SET state='locking',revision=revision+1,sequence=sequence+1,seller_id=excluded.seller_id,owner_email=excluded.owner_email,
-            cycle_price_minor=excluded.cycle_price_minor,free_days=excluded.free_days,trial_days=excluded.trial_days,challenge=excluded.challenge,challenge_until=excluded.challenge_until,egress_ip=NULL,country_code=NULL,check_json=NULL,healthy=0
+            cycle_price_minor=excluded.cycle_price_minor,free_days=excluded.free_days,trial_days=excluded.trial_days,title=excluded.title,paused_at=NULL,challenge=excluded.challenge,challenge_until=excluded.challenge_until,egress_ip=NULL,country_code=NULL,check_json=NULL,healthy=0,egress_checked_at=NULL
             WHERE state='unlisted' OR (state='locking' AND challenge_until<unixepoch() AND check_json IS NULL)",
-            params![id,a.user_id,a.email,v.cycle_price_minor,v.free_days,v.trial_days,challenge]).market()?;
+            params![id,a.user_id,a.email,v.cycle_price_minor,v.free_days,v.trial_days,challenge,title]).market()?;
         if changed != 1 {
             return Err(ListingBlocker::AlreadyListed.error());
         }
@@ -627,7 +666,7 @@ async fn list(
             "hardware":hardware, "version":st.version.chars().take(80).collect::<String>()});
         let (sequence, egress_verified): (i64, bool) = tx.query_row(
             "UPDATE online_client_listings SET sequence=max(sequence,?3+1),challenge=NULL,
-             challenge_until=NULL,check_json=?4,hardware_at=unixepoch()
+             challenge_until=NULL,check_json=?4,hardware_at=unixepoch(),egress_checked_at=unixepoch()
              WHERE installation_id=?1 AND challenge=?2 AND challenge_until>=unixepoch() AND state='locking'
              RETURNING sequence,egress_ip IS NOT NULL",
             params![id, challenge, st.sequence, snapshot.to_string()], |r| Ok((r.get(0)?, r.get(1)?)),
@@ -852,9 +891,13 @@ fn create_quote(
     )
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Confirm {
     acknowledged: bool,
+    /// `end` rents for the trial only: no balance is required and the rental
+    /// ends without a charge when the trial runs out. Older clients omit it.
+    #[serde(default)]
+    after_trial: Option<String>,
 }
 async fn commit(
     State(s): State<ServerState>,
@@ -868,14 +911,24 @@ async fn commit(
             "confirm the rental terms before renting".into(),
         ));
     }
+    let trial_only = match v.after_trial.as_deref() {
+        None | Some("continue") => false,
+        Some("end") => true,
+        Some(_) => return Err(AppError::BadRequest("invalid after-trial choice".into())),
+    };
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
-    let receipt = commit_quote(&tx, &q, &a)?;
+    let receipt = commit_quote(&tx, &q, &a, trial_only)?;
     tx.commit().market()?;
     Ok(Json(receipt))
 }
 
-fn commit_quote(tx: &Transaction<'_>, q: &str, a: &AuthSession) -> Result<Value, AppError> {
+fn commit_quote(
+    tx: &Transaction<'_>,
+    q: &str,
+    a: &AuthSession,
+    trial_only: bool,
+) -> Result<Value, AppError> {
     let replay = tx
         .query_row(
             "SELECT id,state FROM online_client_leases WHERE quote_id=?1 AND buyer_id=?2",
@@ -906,6 +959,15 @@ fn commit_quote(tx: &Transaction<'_>, q: &str, a: &AuthSession) -> Result<Value,
     {
         return Err(conflict("Client offer changed"));
     }
+    // Trial-only needs a paid offer with trial time left and no renewal.
+    let trial_only = trial_only && t.price > 0;
+    if trial_only && (trial <= 0 || auto) {
+        return Err(AppError::coded_conflict(
+            "CLIENT_TRIAL_ONLY_UNAVAILABLE",
+            "no trial remains for this Client, or automatic renewal is on",
+            json!({}),
+        ));
+    }
     let now = Utc::now();
     let date = now.to_rfc3339();
     let lease = Uuid::new_v4().to_string();
@@ -926,7 +988,7 @@ fn commit_quote(tx: &Transaction<'_>, q: &str, a: &AuthSession) -> Result<Value,
                 billing_model: wallet::BillingModel::CalendarMonth,
                 price_minor: t.price,
                 auto_renew: auto,
-                trial_only: false,
+                trial_only,
                 trial_seconds: trial,
                 trial_allowance_seconds: t.trial,
             },
@@ -991,11 +1053,12 @@ async fn end(
     let a = actor(&s, &h).await?;
     let c = s.store.conn.lock().await;
     let tx = c.transaction().market()?;
-    let (installation, state): (String, String) = tx
+    let (installation, state, reclaiming, seller): (String, String, bool, String) = tx
         .query_row(
-            "SELECT installation_id,state FROM online_client_leases WHERE id=?1 AND buyer_id=?2",
+            "SELECT installation_id,state,reclaim_effective_at IS NOT NULL AND reclaim_cancelled_at IS NULL,seller_id
+               FROM online_client_leases WHERE id=?1 AND buyer_id=?2",
             params![id, a.user_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .market()?
@@ -1005,14 +1068,29 @@ async fn end(
         let at = chrono::DateTime::from_timestamp(now, 0)
             .unwrap()
             .to_rfc3339();
-        crate::client_market_termination::accept_tx(
-            &tx,
-            &id,
-            Some(&a.user_id),
-            "client_release",
-            Some(&request),
-            &at,
-        )?;
+        if reclaiming {
+            // The seller already asked for the Client back: leaving early is
+            // never charged as the buyer's choice. Recorded exactly like the
+            // reclaim executing on schedule (the seller's responsibility).
+            seller::deny_buyer_if_requested_tx(&tx, &id)?;
+            crate::client_market_termination::accept_tx(
+                &tx,
+                &id,
+                Some(&seller),
+                "provider_reclaim",
+                None,
+                &at,
+            )?;
+        } else {
+            crate::client_market_termination::accept_tx(
+                &tx,
+                &id,
+                Some(&a.user_id),
+                "client_release",
+                Some(&request),
+                &at,
+            )?;
+        }
         reconcile::fence(&tx, &installation, &id, now)?;
     }
     let termination_id: Option<String> = tx
@@ -1065,6 +1143,7 @@ async fn listings(
         .map(|s| s.user_id);
     let c = s.store.conn.lock().await;
     let health = crate::store::installation_health_minutes_24h(&c)?;
+    let month = online_minutes_30d(&c)?;
     let legacy_hours = query
         .include_available_hours24
         .unwrap_or(true)
@@ -1074,14 +1153,15 @@ async fn listings(
         "SELECT l.installation_id, l.revision, l.state, l.cycle_price_minor, l.free_days, l.trial_days,
                 l.country_code, l.egress_ip, l.check_json, l.probe_healthy, l.observed_at, l.seller_id IS ?1,
                 l.occupied, t.subdomain, coalesce(i.last_seen_ip!=l.egress_ip,0), mp.id,
-                l.probe_error, o.attempts, i.created_at, l.availability, l.exclusive_management, l.owner_rental
+                l.probe_error, o.attempts, i.created_at, l.availability, l.exclusive_management, l.owner_rental,
+                l.title, l.owner_email
          FROM online_client_supply l
          JOIN installations i ON i.id=l.installation_id
          JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
          LEFT JOIN market_provider_profiles mp ON mp.user_id=l.seller_id
          LEFT JOIN online_client_operations o ON o.installation_id=l.installation_id
          WHERE l.state='listed' OR (l.seller_id=?1 AND l.state!='unlisted')
-         ORDER BY l.occupied, (l.availability='available') DESC, l.country_code, t.subdomain"
+         ORDER BY (l.availability='available') DESC, i.created_at, l.installation_id"
     ).market()?;
     let rows = stmt.query_map(params![me], |r| {
         let installation: String = r.get(0)?;
@@ -1091,6 +1171,10 @@ async fn listings(
         let label = if owned { r.get(13)? } else { public_label(&installation) };
         let (healthy, observed) = health.get(&installation).copied().unwrap_or_default();
         let rate = (observed > 0).then(|| crate::store::observed_online_rate(healthy, observed));
+        let (online_30d, observed_30d, observed_days_30d) = month.get(&installation).copied().unwrap_or_default();
+        let rate_30d = (observed_30d > 0).then(|| {
+            crate::store::observed_online_rate(online_30d as usize, observed_30d as usize)
+        });
         let mut item = json!({
             "installationId": installation, "revision": r.get::<_, i64>(1)?, "state": r.get::<_, String>(2)?,
             "cyclePriceMinor": r.get::<_, i64>(3)?, "freeDays": r.get::<_, Option<i64>>(4)?,
@@ -1104,7 +1188,9 @@ async fn listings(
             "registeredAt": r.get::<_, String>(18)?, "availability": r.get::<_, String>(19)?,
             "exclusiveManagement": r.get::<_, bool>(20)?, "ownerRental": r.get::<_, bool>(21)?,
             "onlineRate24h": rate, "observedMinutes24h": observed,
-            "observationCoverage24h": crate::store::observation_coverage(observed)
+            "observationCoverage24h": crate::store::observation_coverage(observed),
+            "onlineRate30d": rate_30d, "observedMinutes30d": observed_30d, "observedDays30d": observed_days_30d,
+            "title": r.get::<_, Option<String>>(22)?, "sellerEmail": r.get::<_, String>(23)?,
         });
         if let Some(hours) = &legacy_hours {
             item["availableHours24"] = json!(hours.get(&installation).copied().unwrap_or_default());
@@ -1113,6 +1199,24 @@ async fn listings(
     }).market()?.collect::<crate::db::Result<Vec<_>>>().market()?;
     Ok(Json(json!({"listings":rows})))
 }
+/// Online and observed minutes over the last 30 UTC days, and how many of
+/// those days have any observation, from the retained daily rollup.
+fn online_minutes_30d(c: &Connection) -> Result<HashMap<String, (i64, i64, i64)>, AppError> {
+    let mut stmt = c
+        .prepare(
+            "SELECT installation_id, SUM(online_minutes), SUM(observed_minutes), SUM(observed_minutes>0)
+               FROM installation_online_days WHERE day_utc>=date('now','-29 days')
+              GROUP BY installation_id",
+        )
+        .market()?;
+    stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+    })
+    .market()?
+    .collect::<crate::db::Result<_>>()
+    .market()
+}
+
 fn public_label(installation: &str) -> String {
     let short: String = installation
         .chars()
@@ -1133,6 +1237,28 @@ struct SellerItem {
     tenant_email: Option<String>,
     expires_at: Option<i64>,
     termination_id: Option<String>,
+    title: Option<String>,
+    paused: bool,
+    /// A scheduled reclaim that has not been cancelled.
+    reclaim_effective_at: Option<i64>,
+    reclaim_mode: Option<String>,
+    /// The seller may reclaim this running rental now.
+    reclaimable: bool,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    end_reason: Option<String>,
+    #[serde(skip)]
+    billing_from: Option<i64>,
+    #[serde(skip)]
+    contract_id: Option<String>,
+    /// Service time of the current period as settlement recorded it.
+    available_seconds: Option<i64>,
+    unavailable_seconds: Option<i64>,
+    settled_through: Option<String>,
+    /// What this rental earned the seller so far, in wallet units: rent net
+    /// of the platform fee plus any termination compensation. Same figures
+    /// as the Owner audit. `None` for free rentals.
+    income_units: Option<String>,
 }
 
 async fn seller_inventory(State(s): State<ServerState>, headers: HeaderMap) -> Reply {
@@ -1146,13 +1272,25 @@ async fn seller_inventory(State(s): State<ServerState>, headers: HeaderMap) -> R
 fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.alias, r.state, q.cycle_price_minor, r.tenant_email, r.grant_until, r.created_at,
-                CASE WHEN l.seller_id=r.seller_id AND l.state!='unlisted' THEN l.installation_id END,(SELECT t.id FROM client_market_terminations t WHERE t.installation_id=r.id)
+                CASE WHEN l.seller_id=r.seller_id AND l.state!='unlisted' THEN l.installation_id END,(SELECT t.id FROM client_market_terminations t WHERE t.installation_id=r.id),
+                l.title, l.paused_at IS NOT NULL,
+                CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_effective_at END,
+                CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_mode END,
+                r.state IN ('starting','active') AND r.cutoff_at IS NULL AND r.released_at IS NULL AND r.buyer_id!=r.seller_id,
+                coalesce(r.activated_at,r.created_at), coalesce(r.released_at,r.cutoff_at),
+                (SELECT t.reason FROM client_market_terminations t WHERE t.installation_id=r.id),
+                CASE WHEN r.released_at IS NULL AND r.activated_at IS NOT NULL THEN coalesce((
+                    SELECT max(unixepoch(p.period_start),r.activated_at) FROM market_platform_contracts k
+                      JOIN market_platform_periods p ON p.contract_id=k.id AND p.sequence=k.current_period_sequence
+                     WHERE k.product_kind='client_host' AND k.product_ref=r.id),r.activated_at) END,
+                (SELECT k.id FROM market_platform_contracts k WHERE k.product_kind='client_host' AND k.product_ref=r.id)
            FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
            JOIN online_client_listings l ON l.installation_id=r.installation_id
           WHERE r.seller_id=?1
           UNION ALL
          SELECT l.installation_id, t.subdomain, l.availability,
-                l.cycle_price_minor, NULL, NULL, l.updated_at, l.installation_id,NULL
+                l.cycle_price_minor, NULL, NULL, l.updated_at, l.installation_id,NULL,
+                l.title, l.paused_at IS NOT NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL
            FROM online_client_supply l JOIN installation_client_tunnels t ON t.installation_id=l.installation_id
           WHERE l.seller_id=?1 AND l.state!='unlisted' AND NOT EXISTS (
                 SELECT 1 FROM online_client_leases r WHERE r.installation_id=l.installation_id AND r.released_at IS NULL)
@@ -1169,11 +1307,50 @@ fn seller_items(conn: &Connection, seller_id: &str) -> Result<Vec<SellerItem>, A
                 tenant_email: row.get(4)?,
                 expires_at: row.get(5)?,
                 termination_id: row.get(8)?,
+                title: row.get(9)?,
+                paused: row.get(10)?,
+                reclaim_effective_at: row.get(11)?,
+                reclaim_mode: row.get(12)?,
+                reclaimable: row.get(13)?,
+                started_at: row.get(14)?,
+                ended_at: row.get(15)?,
+                end_reason: row.get(16)?,
+                billing_from: row.get(17)?,
+                contract_id: row.get(18)?,
+                available_seconds: None,
+                unavailable_seconds: None,
+                settled_through: None,
+                income_units: None,
             })
         })
         .market()?
-        .collect::<crate::db::Result<Vec<_>>>()
+        .collect::<crate::db::Result<Vec<SellerItem>>>()
         .market()?;
+    let mut items = items;
+    for item in items.iter_mut() {
+        if let Some(from) = item.billing_from {
+            if let Some(billed) = crate::client_market_audit::billed_time_tx(conn, &item.id, from)? {
+                item.available_seconds = Some(billed.available_seconds);
+                item.unavailable_seconds = Some(billed.unavailable_seconds);
+                item.settled_through = billed.settled_through;
+            }
+        }
+        if let Some(contract) = item.contract_id.as_deref() {
+            let income: i64 = conn
+                .query_row(
+                    "SELECT coalesce((SELECT SUM(l.net_amount_units-l.reversed_units)
+                         FROM market_delivery_slices d JOIN market_provider_earning_lots l ON l.delivery_slice_id=d.id
+                        WHERE d.contract_kind='client_host' AND d.contract_id=?1),0)
+                      + coalesce((SELECT SUM(c.amount_units-c.reversed_units)
+                         FROM client_market_terminations t JOIN client_termination_compensations c ON c.id=t.id
+                        WHERE t.contract_id=?1),0)",
+                    params![contract],
+                    |r| r.get(0),
+                )
+                .market()?;
+            item.income_units = Some(income.to_string());
+        }
+    }
     Ok(items)
 }
 
@@ -1194,13 +1371,60 @@ async fn mine(
     let mut stmt=c.prepare("SELECT r.id,r.installation_id,r.alias,r.state,r.grant_until,r.activated_at,r.cutoff_at,r.released_at,
         COALESCE((SELECT json_group_array(json_object('kind',kind,'at',recorded_at,'count',occurrences)) FROM (SELECT kind,recorded_at,occurrences FROM online_client_events WHERE lease_id=r.id ORDER BY id DESC LIMIT 50)),'[]'),
         (SELECT id FROM client_market_terminations t WHERE t.installation_id=r.id),q.cycle_price_minor,coalesce(c.renewal_policy='automatic',q.auto_renew),l.country_code,
-        unixepoch(p.period_end),h.status,r.created_at FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
-        JOIN online_client_listings l ON l.installation_id=r.installation_id LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
+        unixepoch(p.period_end),h.status,r.created_at,
+        l.title,
+        CASE WHEN r.state='active' AND r.cutoff_at IS NULL THEN l.egress_ip END,
+        CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_effective_at END,
+        CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_mode END,
+        CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_reason END,
+        c.id,c.after_trial,c.trial_seconds_remaining,c.status,c.paid_started_at IS NOT NULL,
+        (SELECT s.subdomain FROM online_client_share_bindings b JOIN shares s ON s.share_id=b.share_id
+          WHERE b.lease_id=r.id AND s.subdomain IS NOT NULL ORDER BY s.created_at LIMIT 1),
+        r.buyer_id=r.seller_id,l.owner_email,
+        CASE WHEN r.reclaim_cancelled_at IS NULL AND r.reclaim_effective_at IS NOT NULL AND r.reclaim_note!='' THEN r.reclaim_note END,
+        CASE WHEN r.reclaim_cancelled_at IS NULL AND r.reclaim_effective_at IS NOT NULL THEN r.reclaim_reason END,
+        (SELECT t.reason FROM client_market_terminations t WHERE t.installation_id=r.id)='provider_reclaim',
+        coalesce(i.last_seen_ip!=l.egress_ip,0)
+        FROM online_client_leases r JOIN online_client_quotes q ON q.id=r.quote_id
+        JOIN online_client_listings l ON l.installation_id=r.installation_id LEFT JOIN installations i ON i.id=r.installation_id
+        LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
         LEFT JOIN market_platform_periods p ON p.contract_id=c.id AND p.sequence=c.current_period_sequence
         LEFT JOIN market_wallet_holds h ON h.id=c.activation_hold_id WHERE r.buyer_id=?1
         AND (NOT ?2 OR r.released_at IS NULL OR r.id=?3)
         ORDER BY r.released_at IS NULL DESC,r.created_at DESC LIMIT CASE WHEN ?2 THEN -1 ELSE 200 END").market()?;
-    let rows=stmt.query_map(params![a.user_id, query.current, query.focus],|r|Ok(json!({"leaseId":r.get::<_,String>(0)?,"installationId":r.get::<_,String>(1)?,"alias":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"expiresAt":r.get::<_,i64>(4)?,"activatedAt":r.get::<_,Option<i64>>(5)?,"cutoffAt":r.get::<_,Option<i64>>(6)?,"releasedAt":r.get::<_,Option<i64>>(7)?,"terminationId":r.get::<_,Option<String>>(9)?,"clientUrl":s.config.tunnel_url(&r.get::<_,String>(2)?),"events":serde_json::from_str::<Value>(&r.get::<_,String>(8)?).unwrap_or_default(),"cyclePriceMinor":r.get::<_,i64>(10)?,"autoRenew":r.get::<_,bool>(11)?,"country":r.get::<_,Option<String>>(12)?,"periodEnd":r.get::<_,Option<i64>>(13)?,"holdStatus":r.get::<_,Option<String>>(14)?,"createdAt":r.get::<_,i64>(15)?}))).market()?.collect::<crate::db::Result<Vec<_>>>().market()?;
+    let rows = stmt
+        .query_map(params![a.user_id, query.current, query.focus], |r| {
+            let alias: String = r.get(2)?;
+            let share: Option<String> = r.get(26)?;
+            Ok(json!({
+                "leaseId": r.get::<_, String>(0)?, "installationId": r.get::<_, String>(1)?, "alias": alias,
+                "state": r.get::<_, String>(3)?, "expiresAt": r.get::<_, i64>(4)?, "activatedAt": r.get::<_, Option<i64>>(5)?,
+                "cutoffAt": r.get::<_, Option<i64>>(6)?, "releasedAt": r.get::<_, Option<i64>>(7)?,
+                "terminationId": r.get::<_, Option<String>>(9)?, "clientUrl": s.config.tunnel_url(&alias),
+                "events": serde_json::from_str::<Value>(&r.get::<_, String>(8)?).unwrap_or_default(),
+                "cyclePriceMinor": r.get::<_, i64>(10)?, "autoRenew": r.get::<_, bool>(11)?,
+                "country": r.get::<_, Option<String>>(12)?, "periodEnd": r.get::<_, Option<i64>>(13)?,
+                "holdStatus": r.get::<_, Option<String>>(14)?, "createdAt": r.get::<_, i64>(15)?,
+                "title": r.get::<_, Option<String>>(16)?,
+                // The tenant judges the IP quality; only while the rental runs.
+                "egressIp": r.get::<_, Option<String>>(17)?,
+                "reclaimEffectiveAt": r.get::<_, Option<i64>>(18)?, "reclaimMode": r.get::<_, Option<String>>(19)?,
+                // The reason stays visible after the reclaim executes.
+                "reclaimReason": r.get::<_, Option<String>>(30)?,
+                "contractId": r.get::<_, Option<String>>(21)?, "afterTrial": r.get::<_, Option<String>>(22)?,
+                "trialSecondsRemaining": r.get::<_, Option<i64>>(23)?, "contractStatus": r.get::<_, Option<String>>(24)?,
+                "paidStarted": r.get::<_, Option<bool>>(25)?.unwrap_or(false),
+                "shareUrl": share.map(|label| s.config.tunnel_url(&label)),
+                "selfRental": r.get::<_, bool>(27)?, "sellerEmail": r.get::<_, String>(28)?,
+                // Shown before and after a reclaim; the tenant must see why.
+                "reclaimNote": r.get::<_, Option<String>>(29)?,
+                "reclaimed": r.get::<_, Option<bool>>(31)?.unwrap_or(false),
+                "egressDiffers": r.get::<_, bool>(32)?,
+            }))
+        })
+        .market()?
+        .collect::<crate::db::Result<Vec<_>>>()
+        .market()?;
     Ok(Json(json!({"leases":rows})))
 }
 

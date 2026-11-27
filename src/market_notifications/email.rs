@@ -165,7 +165,11 @@ pub(super) fn render(item: &Claimed, dashboard: &str) -> (String, String, String
         ),
         "client_termination_settled" => (
             "Client rental termination settlement",
-            if role == "provider" {
+            if field(p, "reason") == Some("trial_completed") && role != "provider" {
+                "Your trial-only Client rental ended with its trial. You were not charged, and the tenant workspace was removed."
+            } else if field(p, "reason") == Some("provider_reclaim") && role != "provider" {
+                "The seller reclaimed this Client. All unused rent was returned as platform credit, with no early-termination charge."
+            } else if role == "provider" {
                 "The Client rental has ended. Any termination compensation is separate from service income, carries no service commission and moves to your wallet automatically after its seven-day settlement window. Disputed amounts remain held for review."
             } else {
                 "The Client rental has ended. The amount shown is the total unused rent returned as platform credit for this termination, not a new top-up or an external cash refund. Open the termination record to review the settlement."

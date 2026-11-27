@@ -4143,7 +4143,9 @@ pub struct InstallationUpgradeTaskReportResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientRental {
     pub state: String,
-    pub tenant_email: String,
+    /// Only for the buyer, the seller and Router administrators.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_email: Option<String>,
     pub self_rental: bool,
     pub exclusive_management: bool,
     pub migration_required: bool,

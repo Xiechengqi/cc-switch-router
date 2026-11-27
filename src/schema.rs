@@ -452,6 +452,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         130,
         include_str!("../schema/0130_online_client_supply_availability.sql"),
     ),
+    (
+        131,
+        include_str!("../schema/0131_client_market_seller_controls.sql"),
+    ),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {

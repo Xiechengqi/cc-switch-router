@@ -12748,7 +12748,7 @@ impl AppStore {
         proxy: &ProxyRegistry,
         viewer_email: Option<&str>,
     ) -> Result<DashboardResponse, AppError> {
-        self.dashboard_snapshot_for_viewer(config, server_geo, proxy, viewer_email, None)
+        self.dashboard_snapshot_for_viewer(config, server_geo, proxy, viewer_email, None, false)
             .await
     }
     pub async fn dashboard_snapshot_for_viewer(
@@ -12758,6 +12758,7 @@ impl AppStore {
         proxy: &ProxyRegistry,
         viewer_email: Option<&str>,
         viewer_id: Option<&str>,
+        viewer_is_admin: bool,
     ) -> Result<DashboardResponse, AppError> {
         let viewer_sees_full_client_ip = viewer_email.is_some_and(|email| {
             config
@@ -12799,6 +12800,7 @@ impl AppStore {
             client_tunnels,
             market_capable,
             mut current_rentals,
+            lease_bound_shares,
         ) = {
             let conn = self.conn.lock().await;
             let shares = list_shares(&conn)?;
@@ -12864,14 +12866,18 @@ impl AppStore {
                     .map_err(|e| AppError::Internal(e.to_string()))?
                 },
                 {
-                    let mut stmt = conn.prepare("SELECT r.installation_id,r.state,r.tenant_email,r.buyer_id=r.seller_id,
+                    // The tenant's identity is private to the two parties and
+                    // Router administrators; everyone else only sees that the
+                    // Client is rented.
+                    let mut stmt = conn.prepare("SELECT r.installation_id,r.state,
+                            CASE WHEN ?2 OR r.buyer_id=?1 OR r.seller_id=?1 THEN r.tenant_email END,r.buyer_id=r.seller_id,
                             r.management_version=2 AND coalesce(l.exclusive_management,0),
                             CASE WHEN r.buyer_id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND (r.management_version<2 OR l.exclusive_management) THEN r.id END,
                             CASE WHEN r.buyer_id=?1 AND r.state='active' AND r.grant_until>unixepoch() AND (r.management_version<2 OR l.exclusive_management) THEN r.alias END,
                             r.management_version=1 AND (r.state='starting' OR (r.state='active' AND r.grant_until>unixepoch()))
                         FROM online_client_leases r JOIN online_client_listings l USING(installation_id)
                         WHERE r.released_at IS NULL").map_err(|e|AppError::Internal(e.to_string()))?;
-                    stmt.query_map(params![viewer_id], |r| {
+                    stmt.query_map(params![viewer_id, viewer_is_admin], |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             crate::models::DashboardClientRental {
@@ -12883,6 +12889,24 @@ impl AppStore {
                                 control_id: r.get(5)?,
                                 alias: r.get(6)?,
                             },
+                        ))
+                    })
+                    .and_then(|rows| rows.collect::<crate::db::Result<HashMap<_, _>>>())
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+                },
+                {
+                    // A tenant's Shares carry the tenant's email as their owner.
+                    // Keep the rental private on the public board as well.
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT b.share_id,r.buyer_id,r.seller_id FROM online_client_share_bindings b
+                             JOIN online_client_leases r ON r.id=b.lease_id WHERE r.released_at IS NULL",
+                        )
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    stmt.query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
                         ))
                     })
                     .and_then(|rows| rows.collect::<crate::db::Result<HashMap<_, _>>>())
@@ -13090,6 +13114,15 @@ impl AppStore {
                             .clone_from(&grant.effective_operations);
                     }
                 }
+                let share_owner_email = match lease_bound_shares.get(&share.share_id) {
+                    Some((buyer, seller))
+                        if !viewer_is_admin
+                            && viewer_id.is_none_or(|viewer| viewer != buyer && viewer != seller) =>
+                    {
+                        share.owner_email.as_deref().map(mask_email)
+                    }
+                    _ => share.owner_email.clone(),
+                };
                 let mut view = ShareView {
                     grant_capability_policy: share.contract_version
                         == crate::models::GRANT_CAPABILITY_CONTRACT_VERSION,
@@ -13106,7 +13139,7 @@ impl AppStore {
                     share_id: share.share_id,
                     capacity_pool_id: share.capacity_pool_id,
                     share_name: share.share_name,
-                    owner_email: share.owner_email,
+                    owner_email: share_owner_email,
                     description: share.description,
                     free_access: share.free_access,
                     subdomain: share.subdomain,

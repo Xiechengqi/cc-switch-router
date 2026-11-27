@@ -15,7 +15,7 @@ use crate::error::AppError;
 
 mod detail;
 mod personal;
-pub(crate) use personal::private_response;
+pub(crate) use personal::{billed_time_tx, private_response};
 #[cfg(test)]
 mod tests;
 

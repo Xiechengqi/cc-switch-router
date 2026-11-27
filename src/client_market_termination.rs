@@ -214,7 +214,16 @@ fn preview_tx(
     } else {
         b
     };
-    let cap = if b.eligible {
+    // Once the seller has asked for the Client back, leaving early is free.
+    let reclaiming: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM online_client_leases WHERE id=?1
+                 AND reclaim_effective_at IS NOT NULL AND reclaim_cancelled_at IS NULL)",
+            params![installation],
+            |r| r.get(0),
+        )
+        .map_err(db_error("read Client reclaim"))?;
+    let cap = if b.eligible && !reclaiming {
         compensation(b.amount, b.remaining, b.rate)?
     } else {
         0
@@ -299,6 +308,20 @@ pub(crate) fn accept_tx(
             "cleanup actor is not a party to this rental".into(),
         ));
     }
+    // A seller reclaim carries the seller's explanation into the record, so
+    // the tenant and the Owner can discuss it.
+    let reclaim_note: String = if reason == "provider_reclaim" {
+        conn.query_row(
+            "SELECT reclaim_note FROM online_client_leases WHERE id=?1",
+            params![installation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error("read Client reclaim note"))?
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let (reason, claim, responsibility) = if voluntary {
         if actor != Some(b.buyer.as_str()) {
             return Err(AppError::Forbidden(
@@ -350,7 +373,7 @@ pub(crate) fn accept_tx(
     } else {
         (
             reason,
-            "",
+            reclaim_note.as_str(),
             if actor == Some(b.provider.as_str()) {
                 "provider"
             } else {
@@ -921,7 +944,7 @@ fn notify_tx(conn: &Connection, t: &Termination, stage: &str, at: &str) -> Resul
             "client_termination",
             &t.id,
             &format!("client_termination:{}:{stage}:{role}", t.id),
-            json!({"terminationId":t.id,"role":role,"status":t.status,
+            json!({"terminationId":t.id,"role":role,"status":t.status,"reason":t.reason,
                 "amountUnits":if role=="buyer" {t.returned_units} else {t.compensation_units}.to_string(),
                 "heldUnits":t.held_units.to_string(),"recordedAt":at,"clientReference":t.client_subdomain.as_deref().unwrap_or(&t.installation_id),
                 "walletReturnUnits":t.returned_units.to_string(),"compensationUnits":t.compensation_units.to_string()}),

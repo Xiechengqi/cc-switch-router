@@ -62,6 +62,19 @@ impl AppError {
         }
     }
 
+    pub fn coded_bad_request(
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self::Coded {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+            details,
+        }
+    }
+
     pub fn coded_conflict(code: &'static str, message: impl Into<String>, details: Value) -> Self {
         Self::Coded {
             status: StatusCode::CONFLICT,

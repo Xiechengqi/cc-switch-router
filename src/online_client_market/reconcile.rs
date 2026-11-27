@@ -32,8 +32,7 @@ pub(super) fn fence(
     // The ending lease is the durable retry record for the financial snapshot.
     c.execute_batch("SAVEPOINT online_automatic_exit")
         .market()?;
-    match crate::client_market_termination::accept_tx(c, id, None, "workspace_expired", None, &time)
-    {
+    match automatic_exit_tx(c, id, now) {
         Ok(()) => c.execute_batch("RELEASE online_automatic_exit").market()?,
         Err(error) => {
             c.execute_batch("ROLLBACK TO online_automatic_exit; RELEASE online_automatic_exit")
@@ -43,6 +42,32 @@ pub(super) fn fence(
     }
     Ok(())
 }
+/// Record why the system closes a rental. A due seller reclaim is the seller's
+/// responsibility; a trial-only rental whose trial ran out ended with its
+/// trial; anything else is an ordinary expiry. All three return unused rent
+/// in full. A termination recorded earlier (e.g. by the buyer) wins.
+pub(super) fn automatic_exit_tx(c: &Connection, id: &str, cutoff: i64) -> Result<(), AppError> {
+    let (seller, reclaimed, trial_done): (String, bool, bool) = c
+        .query_row(
+            "SELECT r.seller_id,
+                    coalesce(r.reclaim_effective_at<=?2 AND r.reclaim_cancelled_at IS NULL,0),
+                    coalesce((SELECT k.after_trial='end' AND k.paid_started_at IS NULL AND k.trial_seconds_remaining<=0
+                        FROM market_platform_contracts k WHERE k.product_kind='client_host' AND k.product_ref=r.id),0)
+               FROM online_client_leases r WHERE r.id=?1",
+            params![id, cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .market()?;
+    let at = iso(cutoff)?;
+    if reclaimed {
+        crate::client_market_termination::accept_tx(c, id, Some(&seller), "provider_reclaim", None, &at)
+    } else if trial_done {
+        crate::client_market_termination::accept_tx(c, id, None, "trial_completed", None, &at)
+    } else {
+        crate::client_market_termination::accept_tx(c, id, None, "workspace_expired", None, &at)
+    }
+}
+
 fn children_finished(c: &Connection, id: &str, at: &str) -> Result<bool, AppError> {
     let mut stmt=c.prepare("SELECT s.id,s.service_started_at FROM share_market_subscriptions s JOIN online_client_share_bindings b ON b.share_id=s.share_id
         WHERE b.lease_id=?1 AND s.status NOT IN ('released','grant_failed')").market()?;
@@ -294,6 +319,31 @@ fn release(c: &Connection, l: &Rental, now: i64) -> Result<(), AppError> {
         params![l.id, now],
     )
     .market()?;
+    // A seller who reclaimed the Client usually wants it back: unlist it once
+    // the workspace is verified clean, instead of offering it again.
+    let unlist: bool = c
+        .query_row(
+            "SELECT reclaim_unlist_after=1 AND reclaim_effective_at IS NOT NULL AND reclaim_cancelled_at IS NULL
+               FROM online_client_leases WHERE id=?1",
+            params![l.id],
+            |r| r.get(0),
+        )
+        .market()?;
+    if unlist {
+        let seq: Option<i64> = c
+            .query_row(
+                "UPDATE online_client_listings SET state='unlocking',revision=revision+1,sequence=sequence+1,
+                     challenge=NULL,paused_at=NULL
+                 WHERE installation_id=?1 AND state='listed' RETURNING sequence",
+                params![installation],
+                |r| r.get(0),
+            )
+            .optional()
+            .market()?;
+        if let Some(seq) = seq {
+            queue(c, &installation, seq, json!({"operation":"unlist"}))?;
+        }
+    }
     Ok(())
 }
 
@@ -449,14 +499,7 @@ fn apply_status(
                 {
                     return Ok(false);
                 }
-                crate::client_market_termination::accept_tx(
-                    c,
-                    &l.id,
-                    None,
-                    "workspace_expired",
-                    None,
-                    &cutoff,
-                )?;
+                automatic_exit_tx(c, &l.id, l.cutoff.unwrap_or(now))?;
                 if grant.is_none() {
                     if queue_handback(c, id, &l, st)? {
                         return Ok(false);
@@ -713,6 +756,35 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
                 json!({"operation":"extend","leaseId":id,"expiresAt":until}),
             )?;
         }
+        let reclaims = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT installation_id,id,reclaim_reason FROM online_client_leases
+                     WHERE reclaim_effective_at<=?1 AND reclaim_cancelled_at IS NULL AND released_at IS NULL
+                       AND state IN ('starting','active') AND cutoff_at IS NULL LIMIT 100",
+                )
+                .market()?;
+            stmt.query_map(params![now], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })
+            .market()?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .market()?
+        };
+        let reclaimed = !reclaims.is_empty();
+        for (installation, id, reason) in reclaims {
+            super::seller::deny_buyer_if_requested_tx(&tx, &id)?;
+            super::seller::lease_event_tx(&tx, &id, &format!("reclaim:{now}:executed"), "reclaim_executed", now)?;
+            super::seller::notify_tenant_tx(
+                &tx,
+                &id,
+                &format!("reclaim:{now}:executed"),
+                "client_lease_reclaimed",
+                json!({ "reason": reason }),
+                now * 1000,
+            )?;
+            fence(&tx, &installation, &id, now)?;
+        }
         let expired = {
             let mut stmt=tx.prepare("SELECT r.installation_id,r.id,min(r.grant_until,?1) FROM online_client_leases r LEFT JOIN market_platform_contracts c ON c.product_ref=r.id AND c.product_kind='client_host'
             WHERE r.state IN ('starting','active') AND ((r.grant_until<unixepoch()-300) OR (r.grant_until<=unixepoch() AND (c.id IS NULL AND EXISTS(SELECT 1 FROM online_client_quotes q WHERE q.id=r.quote_id AND q.free_days IS NOT NULL) OR c.id IS NOT NULL AND c.status!='trialing' AND NOT EXISTS(SELECT 1 FROM market_platform_periods p WHERE p.contract_id=c.id AND p.sequence=c.current_period_sequence AND unixepoch(p.period_end)>unixepoch())
@@ -728,7 +800,7 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
             .collect::<crate::db::Result<Vec<_>>>()
             .market()?
         };
-        let fenced = !expired.is_empty();
+        let fenced = reclaimed || !expired.is_empty();
         for (installation, id, cutoff) in expired {
             fence(&tx, &installation, &id, cutoff)?;
         }
@@ -771,6 +843,112 @@ async fn cycle(s: &ServerState, prune: bool, ending_cursor: &mut String) -> Resu
             }
         })
         .await;
+    let due = {
+        let c = s.store.conn.lock().await;
+        let mut stmt = c
+            .prepare(
+                "SELECT installation_id FROM online_client_listings
+                 WHERE state='listed' AND coalesce(egress_checked_at,0)<=unixepoch()-?1
+                 ORDER BY coalesce(egress_checked_at,0),installation_id LIMIT 8",
+            )
+            .market()?;
+        stmt.query_map(params![EGRESS_RECHECK_SECS], |r| r.get::<_, String>(0))
+            .market()?
+            .collect::<crate::db::Result<Vec<_>>>()
+            .market()?
+    };
+    stream::iter(due)
+        .for_each_concurrent(4, |id| async move {
+            if let Err(e) = recheck_egress(s, &id).await {
+                tracing::debug!(installation_id=id,error=%e,"Client egress re-check deferred");
+            }
+        })
+        .await;
+    Ok(())
+}
+
+/// Tenants evaluate the egress IP themselves, so the real outbound path is
+/// re-measured about hourly and a change is reported to the current tenant.
+const EGRESS_RECHECK_SECS: i64 = 3_600;
+/// A failed re-check is retried after about ten minutes.
+const EGRESS_RETRY_SECS: i64 = 600;
+
+async fn recheck_egress(s: &ServerState, id: &str) -> Result<(), AppError> {
+    let challenge = Uuid::new_v4().simple().to_string();
+    {
+        let c = s.store.conn.lock().await;
+        c.execute(
+            "UPDATE online_client_listings SET egress_checked_at=unixepoch()-?2 WHERE installation_id=?1",
+            params![id, EGRESS_RECHECK_SECS - EGRESS_RETRY_SECS],
+        )
+        .market()?;
+        c.execute(
+            "INSERT INTO online_client_preflight(challenge,installation_id,expires_at) VALUES(?1,?2,unixepoch()+30)",
+            params![challenge, id],
+        )
+        .market()?;
+    }
+    let checked = super::probe_listing(s, id, &challenge).await;
+    let c = s.store.conn.lock().await;
+    let tx = c.transaction().market()?;
+    let measured: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "DELETE FROM online_client_preflight WHERE challenge=?1 RETURNING egress_ip,country_code",
+            params![challenge],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .market()?;
+    let (Ok(_), Some((Some(ip), country))) = (checked, measured) else {
+        tx.commit().market()?;
+        return Ok(());
+    };
+    let (old_ip, old_country): (Option<String>, Option<String>) = tx
+        .query_row(
+            "SELECT egress_ip,country_code FROM online_client_listings WHERE installation_id=?1 AND state='listed'",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .market()?
+        .unwrap_or_default();
+    let country = country.or(old_country.clone());
+    tx.execute(
+        "UPDATE online_client_listings SET egress_ip=?2,country_code=?3,egress_checked_at=unixepoch()
+         WHERE installation_id=?1 AND state='listed'",
+        params![id, ip, country],
+    )
+    .market()?;
+    if old_ip.as_deref().is_some_and(|old| old != ip) {
+        let lease: Option<String> = tx
+            .query_row(
+                "SELECT id FROM online_client_leases WHERE installation_id=?1 AND released_at IS NULL
+                   AND state IN ('starting','active')",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .market()?;
+        if let Some(lease) = lease {
+            let now = stamp();
+            super::seller::lease_event_tx(&tx, &lease, &format!("egress:{now}"), "egress_changed", now)?;
+            super::seller::notify_tenant_tx(
+                &tx,
+                &lease,
+                &format!("egress:{now}"),
+                "client_egress_changed",
+                // Only the tenant receives this, and the tenant already sees
+                // the full IP; a change within the same /24 must stay visible.
+                json!({
+                    "fromIp": old_ip, "toIp": ip,
+                    "fromCountry": old_country, "toCountry": country,
+                    "countryChanged": old_country.is_some() && old_country != country,
+                }),
+                now * 1000,
+            )?;
+        }
+    }
+    tx.commit().market()?;
     Ok(())
 }
 
@@ -920,10 +1098,10 @@ mod tests {
         let alpha_quote = offer(&tx, &a);
         let beta_quote = offer(&tx, &b);
         let now = stamp();
-        let started = commit_quote(&tx, &alpha_quote, &a).unwrap();
-        assert_eq!(commit_quote(&tx, &alpha_quote, &a).unwrap(), started);
-        assert!(commit_quote(&tx, &alpha_quote, &b).is_err());
-        assert!(commit_quote(&tx, &beta_quote, &b).is_err());
+        let started = commit_quote(&tx, &alpha_quote, &a, false).unwrap();
+        assert_eq!(commit_quote(&tx, &alpha_quote, &a, false).unwrap(), started);
+        assert!(commit_quote(&tx, &alpha_quote, &b, false).is_err());
+        assert!(commit_quote(&tx, &beta_quote, &b, false).is_err());
         let rental = current(&tx, "physical").unwrap().unwrap();
         let nonce = format!("lease_{}_{}", rental.id, Uuid::new_v4().simple());
         check_nonce(&tx, "physical", "client_tunnel_lease", &nonce).unwrap();
@@ -993,13 +1171,13 @@ mod tests {
         first.events.clear();
         first.cleanup_safe = false;
         assert!(!apply_status(&tx, "physical", 3, &first, now + 2).unwrap());
-        assert!(commit_quote(&tx, &beta_quote, &b).is_err());
+        assert!(commit_quote(&tx, &beta_quote, &b, false).is_err());
         first.cleanup_safe = true;
         assert!(apply_status(&tx, "physical", 3, &first, now + 2).unwrap());
         assert_eq!(current(&tx, "physical").unwrap().unwrap().state, "cleaning");
         assert!(!apply_status(&tx, "physical", 4, &first, now + 2).unwrap());
         assert!(apply_status(&tx, "physical", 4, &status(4, None), now + 3).unwrap());
-        let next = commit_quote(&tx, &beta_quote, &b).unwrap();
+        let next = commit_quote(&tx, &beta_quote, &b, false).unwrap();
         assert_ne!(next["leaseId"], started["leaseId"]);
         assert!(check_share_id(&tx, "physical", "alpha-share").is_err());
         assert!(check_nonce(&tx, "physical", "share_edit_ack", &nonce).is_err());
@@ -1018,7 +1196,7 @@ mod tests {
         listed(&tx);
         let buyer = actor("alpha");
         let quote = offer(&tx, &buyer);
-        let receipt = commit_quote(&tx, &quote, &buyer).unwrap();
+        let receipt = commit_quote(&tx, &quote, &buyer, false).unwrap();
         let now = stamp();
         fence(&tx, "physical", receipt["leaseId"].as_str().unwrap(), now).unwrap();
         assert!(!apply_status(&tx, "physical", 3, &status(1, None), now).unwrap());
@@ -1026,7 +1204,7 @@ mod tests {
         assert!(apply_status(&tx, "physical", 3, &status(3, None), now).unwrap());
         assert!(current(&tx, "physical").unwrap().is_none());
         assert_eq!(
-            commit_quote(&tx, &quote, &buyer).unwrap()["state"],
+            commit_quote(&tx, &quote, &buyer, false).unwrap()["state"],
             "released"
         );
     }
@@ -1094,12 +1272,12 @@ mod tests {
             assert!(terms["freeDays"].is_null() && quote["walletFunding"].is_null());
             st.owner_rental = false;
             apply_status(&tx, "physical", 1, &st, now).unwrap();
-            assert!(commit_quote(&tx, q, &owner).is_err());
+            assert!(commit_quote(&tx, q, &owner, false).is_err());
             st.owner_rental = true;
             apply_status(&tx, "physical", 1, &st, now).unwrap();
-            let receipt = commit_quote(&tx, q, &owner).unwrap();
-            assert_eq!(commit_quote(&tx, q, &owner).unwrap(), receipt);
-            assert!(commit_quote(&tx, &external, &other).is_err());
+            let receipt = commit_quote(&tx, q, &owner, false).unwrap();
+            assert_eq!(commit_quote(&tx, q, &owner, false).unwrap(), receipt);
+            assert!(commit_quote(&tx, &external, &other, false).is_err());
             let rental = current(&tx, "physical").unwrap().unwrap();
             assert!(rental.until >= now + 30 * 86400);
             apply_status(&tx, "physical", 2, &status(2, Some(&rental)), now).unwrap();
@@ -1122,11 +1300,11 @@ mod tests {
                 .unwrap();
             assert!(!traces);
             fence(&tx, "physical", &rental.id, now + 1).unwrap();
-            assert!(commit_quote(&tx, &external, &other).is_err());
+            assert!(commit_quote(&tx, &external, &other, false).is_err());
             let mut stopped = status(3, Some(&rental));
             stopped.fenced = true;
             apply_status(&tx, "physical", 3, &stopped, now + 2).unwrap();
-            assert!(commit_quote(&tx, &external, &other).is_err());
+            assert!(commit_quote(&tx, &external, &other, false).is_err());
             let mut clean = status(4, None);
             clean.awaiting_return = Some(rental.id.clone());
             assert!(!apply_status(&tx, "physical", 4, &clean, now + 3).unwrap());
@@ -1134,7 +1312,7 @@ mod tests {
             clean.sequence = 5;
             assert!(apply_status(&tx, "physical", 5, &clean, now + 4).unwrap());
             assert_ne!(
-                commit_quote(&tx, &external, &other).unwrap()["leaseId"],
+                commit_quote(&tx, &external, &other, false).unwrap()["leaseId"],
                 receipt["leaseId"]
             );
         }
@@ -1187,7 +1365,7 @@ mod tests {
         assert_eq!(frozen(&quote), (0, 86_400));
         assert_eq!(frozen(&fresh_quote), (1, 86_400));
         assert!(matches!(
-            commit_quote(&tx, &quote, &buyer),
+            commit_quote(&tx, &quote, &buyer, false),
             Err(AppError::Conflict(_))
         ));
         let after = crate::market_wallet::wallet_snapshot_tx(&tx, "alpha").unwrap();
@@ -1198,7 +1376,7 @@ mod tests {
                  OR EXISTS(SELECT 1 FROM online_client_operations)", [], |r| r.get::<_, bool>(0),
         ).unwrap());
         assert_eq!(
-            commit_quote(&tx, &fresh_quote, &buyer).unwrap()["state"],
+            commit_quote(&tx, &fresh_quote, &buyer, false).unwrap()["state"],
             "starting"
         );
     }
@@ -1218,7 +1396,7 @@ mod tests {
         )
         .unwrap();
         let start = (stamp() / 3600 + 1) * 3600;
-        commit_quote(&tx, &quote, &buyer).unwrap();
+        commit_quote(&tx, &quote, &buyer, false).unwrap();
         assert!(
             crate::market_wallet::wallet_snapshot_tx(&tx, "alpha")
                 .unwrap()
@@ -1239,7 +1417,7 @@ mod tests {
             |r| Ok([r.get::<_,i64>(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?]),
         ).unwrap();
         assert_eq!(commission, [1, 1000, 1, 1000, 1, 1000]);
-        assert_eq!(commit_quote(&tx, &quote, &buyer).unwrap()["leaseId"], l.id);
+        assert_eq!(commit_quote(&tx, &quote, &buyer, false).unwrap()["leaseId"], l.id);
         for (hour, success) in [(0, 10), (1, 9)] {
             for slot in 0..12 {
                 sample(

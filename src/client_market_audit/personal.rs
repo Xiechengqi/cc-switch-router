@@ -246,8 +246,16 @@ fn detail_tx(
             "SELECT r.id,c.id,c.paid_started_at IS NOT NULL,EXISTS(SELECT 1 FROM market_service_disputes d WHERE d.contract_id=c.id AND d.status='open'),
                     r.created_at+600,r.grant_until,h.status,
                     r.state='active' AND r.management_version=2 AND coalesce(l.exclusive_management,0) AND coalesce(i.upgrade_capable,1),
-                    r.management_version=1
+                    r.management_version=1,
+                    CASE WHEN r.state='active' AND r.cutoff_at IS NULL THEN l.egress_ip END,l.country_code,coalesce(i.last_seen_ip!=l.egress_ip,0),l.title,
+                    CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_effective_at END,
+                    CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_mode END,
+                    CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL THEN r.reclaim_reason END,
+                    CASE WHEN r.activated_at IS NOT NULL THEN max(coalesce(unixepoch(p.period_start),r.activated_at),r.activated_at) END,
+                    c.after_trial,c.status,
+                    CASE WHEN r.reclaim_cancelled_at IS NULL AND r.state IN ('starting','active') AND r.cutoff_at IS NULL AND r.reclaim_effective_at IS NOT NULL THEN r.reclaim_note END
                FROM online_client_leases r LEFT JOIN market_platform_contracts c ON c.product_kind='client_host' AND c.product_ref=r.id
+               LEFT JOIN market_platform_periods p ON p.contract_id=c.id AND p.sequence=c.current_period_sequence
                JOIN online_client_listings l ON l.installation_id=r.installation_id
                LEFT JOIN installations i ON i.id=r.installation_id
                LEFT JOIN market_wallet_holds h ON h.id=c.activation_hold_id
@@ -256,11 +264,28 @@ fn detail_tx(
             |r| Ok(json!({"leaseId":r.get::<_,String>(0)?,"contractId":r.get::<_,Option<String>>(1)?,
                 "canDispute":r.get::<_,bool>(2)?,"openDispute":r.get::<_,bool>(3)?,"activationDeadline":r.get::<_,i64>(4)?,
                 "grantUntil":r.get::<_,i64>(5)?,"holdStatus":r.get::<_,Option<String>>(6)?,"canUpgrade":r.get::<_,bool>(7)?,
-                "migrationRequired":r.get::<_,bool>(8)?})),
+                "migrationRequired":r.get::<_,bool>(8)?,
+                // The tenant evaluates the egress IP themselves while the rental runs.
+                "egressIp":r.get::<_,Option<String>>(9)?,"country":r.get::<_,Option<String>>(10)?,
+                "egressDiffers":r.get::<_,bool>(11)?,"title":r.get::<_,Option<String>>(12)?,
+                "reclaimEffectiveAt":r.get::<_,Option<i64>>(13)?,"reclaimMode":r.get::<_,Option<String>>(14)?,
+                "reclaimReason":r.get::<_,Option<String>>(15)?,"billingFrom":r.get::<_,Option<i64>>(16)?,
+                "afterTrial":r.get::<_,Option<String>>(17)?,"contractStatus":r.get::<_,Option<String>>(18)?,
+                "reclaimNote":r.get::<_,Option<String>>(19)?.filter(|note| !note.is_empty())})),
         ).optional().map_err(db_error("read buyer lease actions"))?
     } else {
         None
     };
+    let rental = rental.map(|mut rental| -> Result<Value, AppError> {
+        if let (Some(lease), Some(from)) = (rental["leaseId"].as_str(), rental["billingFrom"].as_i64()) {
+            if let Some(billed) = billed_time_tx(conn, lease, from)? {
+                rental["availableSeconds"] = json!(billed.available_seconds);
+                rental["unavailableSeconds"] = json!(billed.unavailable_seconds);
+                rental["settledThrough"] = json!(billed.settled_through);
+            }
+        }
+        Ok(rental)
+    }).transpose()?;
     let periods: Vec<_> = detail["periods"]
         .as_array()
         .into_iter()
@@ -295,6 +320,38 @@ fn detail_tx(
         "events":events,"eventsNextCursor":detail["eventsNextCursor"],"trialConsumedSeconds":detail["trialConsumedSeconds"],
         "settlement":detail["settlement"],"serverNow":detail["serverNow"]}),
     )
+}
+
+/// Service time of the current period as settlement recorded it: the
+/// hour-by-hour availability evidence that monthly billing (10 of 12 probes)
+/// and trial consumption are computed from. Reading the record itself keeps
+/// both parties' figure equal to what was charged. `None` without a contract
+/// (free rentals are never charged).
+pub(crate) struct BilledTime {
+    pub available_seconds: i64,
+    pub unavailable_seconds: i64,
+    pub settled_through: Option<String>,
+}
+
+pub(crate) fn billed_time_tx(conn: &Connection, lease: &str, from: i64) -> Result<Option<BilledTime>, AppError> {
+    conn.query_row(
+        "SELECT count(DISTINCT k.id),
+                coalesce(sum(CASE WHEN e.service_available=1
+                    THEN unixepoch(e.ended_at)-max(unixepoch(e.started_at),?2) END),0),
+                coalesce(sum(CASE WHEN e.service_available=0
+                    THEN unixepoch(e.ended_at)-max(unixepoch(e.started_at),?2) END),0),
+                max(e.ended_at)
+           FROM market_platform_contracts k
+           LEFT JOIN market_platform_service_evidence e ON e.contract_id=k.id
+            AND e.source_kind='client_host_health' AND unixepoch(e.ended_at)>?2
+          WHERE k.product_kind='client_host' AND k.product_ref=?1",
+        params![lease, from],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?)),
+    )
+    .map(|(contracts, available_seconds, unavailable_seconds, settled_through)| {
+        (contracts > 0).then_some(BilledTime { available_seconds, unavailable_seconds, settled_through })
+    })
+    .map_err(db_error("read billed Client time"))
 }
 
 #[cfg(test)]

@@ -176,6 +176,23 @@ fn set_wallet_renewal_tx(
                 "a trial-only rental cannot renew; continue after the trial first".into(),
             ));
         }
+        let reclaiming: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM market_platform_contracts c
+                     JOIN online_client_leases r ON r.id = c.product_ref
+                     WHERE c.id = ?1 AND c.product_kind = 'client_host'
+                       AND r.reclaim_effective_at IS NOT NULL AND r.reclaim_cancelled_at IS NULL)",
+                params![contract_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error("read Client reclaim"))?;
+        if reclaiming {
+            return Err(AppError::coded_conflict(
+                "CLIENT_RECLAIM_PENDING",
+                "the seller is reclaiming this Client; it cannot renew",
+                serde_json::json!({}),
+            ));
+        }
         if let Some(end) = current.period_end.as_deref() {
             if parse_time(end)? <= parse_time(at)? {
                 return Err(AppError::Conflict(
@@ -243,27 +260,34 @@ async fn update_wallet_renewal(
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(view)))
 }
 
-/// Most Share trial-only rentals one buyer may hold at once. They need no
-/// balance, so the cap keeps one account from parking many seats.
+/// Most trial-only rentals one buyer may hold at once in each market (Share
+/// and Client count separately). They need no balance, so the cap keeps one
+/// account from parking many seats or Clients.
 pub(crate) const MAX_ACTIVE_TRIAL_ONLY: i64 = 3;
 
 pub(crate) fn require_trial_only_capacity_tx(
     conn: &Connection,
     buyer: &str,
+    product_kind: &str,
     except: Option<&str>,
 ) -> Result<(), AppError> {
     let active: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM market_platform_contracts
-             WHERE buyer_user_id = ?1 AND after_trial = 'end' AND paid_started_at IS NULL
+             WHERE buyer_user_id = ?1 AND product_kind = ?3 AND after_trial = 'end'
+               AND paid_started_at IS NULL
                AND status IN ('pending_activation', 'trialing') AND id IS NOT ?2",
-            params![buyer, except],
+            params![buyer, except, product_kind],
             |row| row.get(0),
         )
         .map_err(db_error("count trial-only rentals"))?;
     if active >= MAX_ACTIVE_TRIAL_ONLY {
         return Err(AppError::coded_conflict(
-            "SHARE_TRIAL_ONLY_LIMIT",
+            if product_kind == "client_host" {
+                "CLIENT_TRIAL_ONLY_LIMIT"
+            } else {
+                "SHARE_TRIAL_ONLY_LIMIT"
+            },
             "too many trial-only rentals are running; end one or rent as a paid rental",
             serde_json::json!({ "limit": MAX_ACTIVE_TRIAL_ONLY }),
         ));
@@ -278,9 +302,23 @@ struct UpdateAfterTrialRequest {
     expected: String,
 }
 
-/// Switches a running Share trial between trial-only and converting to paid
-/// service. Converting needs the first period's balance now, exactly like a
-/// paid rental; the debit still happens only when the trial ends.
+/// The Client rental bound to this contract is still running (not ending).
+fn client_trial_lease_open_tx(conn: &Connection, contract_id: &str) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM market_platform_contracts c
+             JOIN online_client_leases r ON r.id = c.product_ref
+             WHERE c.id = ?1 AND c.product_kind = 'client_host'
+               AND r.state IN ('starting', 'active') AND r.cutoff_at IS NULL
+               AND (r.reclaim_effective_at IS NULL OR r.reclaim_cancelled_at IS NOT NULL))",
+        params![contract_id],
+        |row| row.get(0),
+    )
+    .map_err(db_error("read Client trial lease"))
+}
+
+/// Switches a running Share or Client trial between trial-only and converting
+/// to paid service. Converting needs the first period's balance now, exactly
+/// like a paid rental; the debit still happens only when the trial ends.
 fn set_after_trial_tx(
     conn: &Connection,
     contract_id: &str,
@@ -319,14 +357,24 @@ fn set_after_trial_tx(
         )
         .optional()
         .map_err(db_error("read Share trial phase"))?;
-    if kind != "share"
+    // A Client trial has no separate phase record: the contract itself is
+    // still in its trial until the first paid month starts.
+    let in_trial = match kind.as_str() {
+        "share" => phase.as_deref() == Some("trial"),
+        "client_host" => client_trial_lease_open_tx(conn, contract_id)?,
+        _ => false,
+    };
+    if !in_trial
         || !matches!(status.as_str(), "pending_activation" | "trialing")
         || remaining <= 0
         || paid_started.is_some()
-        || phase.as_deref() != Some("trial")
     {
         return Err(AppError::coded_conflict(
-            "SHARE_TRIAL_ENDED",
+            if kind == "client_host" {
+                "CLIENT_TRIAL_ENDED"
+            } else {
+                "SHARE_TRIAL_ENDED"
+            },
             "the trial has ended; this choice can no longer change",
             serde_json::json!({}),
         ));
@@ -336,7 +384,7 @@ fn set_after_trial_tx(
             crate::market_reconcile::ensure_contract_finance_safe_tx(conn, contract_id)?;
             crate::market_wallet::require_order_funding_tx(conn, buyer, price, at)?;
         } else {
-            require_trial_only_capacity_tx(conn, buyer, Some(contract_id))?;
+            require_trial_only_capacity_tx(conn, buyer, &kind, Some(contract_id))?;
         }
         let changed = conn
             .execute(
@@ -772,7 +820,9 @@ pub(crate) fn prepare_contract_tx(
         || !(input.trial_seconds..=30 * 86_400).contains(&input.trial_allowance_seconds)
         || (input.billing_model == BillingModel::Metered && input.auto_renew)
         || (input.trial_only
-            && (input.product_kind != "share" || input.trial_seconds <= 0 || input.auto_renew))
+            && (!matches!(input.product_kind, "share" | "client_host")
+                || input.trial_seconds <= 0
+                || input.auto_renew))
     {
         return Err(AppError::BadRequest("invalid platform contract".into()));
     }
@@ -867,7 +917,7 @@ pub(crate) fn prepare_contract_tx(
     }
     let id = Uuid::new_v4().to_string();
     if input.trial_only {
-        require_trial_only_capacity_tx(conn, input.buyer_user_id, None)?;
+        require_trial_only_capacity_tx(conn, input.buyer_user_id, input.product_kind, None)?;
     } else {
         crate::market_wallet::require_order_funding_tx(
             conn,
