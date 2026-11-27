@@ -1088,7 +1088,8 @@ mod tests {
     // Migration 125 adds the lease-bound initial monitor bootstrap queue.
     // Migration 126 adds the year-long Host health day aggregate.
     // Migration 127 adds seven online leasing tables and removes obsolete SSH operations.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 296;
+    // Migration 132 adds the durable Client identity and audited identity alias tables.
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 298;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {
