@@ -23,7 +23,6 @@ export type AuditFilters = {
   attention?: string; from?: string; until?: string;
 };
 export const AUDIT_LIST_PAGE_SIZE = 5;
-const MAX_PAGE = 4_294_967_295;
 export type AuditPage = { items: AuditRecord[]; total: number; page: number; pageSize: typeof AUDIT_LIST_PAGE_SIZE; totalPages: number; serverNow: string };
 export type AuditPeriod = {
   id: string; sequence: number; startedAt: string; endedAt: string; debitedAt: string;
@@ -44,6 +43,30 @@ const nullableTime = (v: unknown) => v === null || time(v);
 const integer = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 const nullableInteger = (v: unknown) => v === null || integer(v);
 const units = (v: unknown) => typeof v === "string" && /^(0|[1-9]\d{0,18})$/.test(v) && BigInt(v) <= 9223372036854775807n;
+/** Shared with the Share Market audit, which reads the same ledger shapes. */
+export const auditShape = { object, text, nullableText, time, nullableTime, integer, nullableInteger, units };
+export const AUDIT_MAX_PAGE = 4_294_967_295;
+export function validAuditMoney(v: unknown): v is AuditMoney | null {
+  return v === null || object(v) && AUDIT_MONEY_FIELDS.every(k => units(v[k]));
+}
+/** The list envelope both markets share: fixed page size, server-clamped page. */
+export function validAuditPageEnvelope(v: Record<string, unknown>, items: unknown[]) {
+  return integer(v.total) && time(v.serverNow) && v.pageSize === AUDIT_LIST_PAGE_SIZE && integer(v.page) && v.page >= 1 && v.page <= AUDIT_MAX_PAGE
+    && integer(v.totalPages) && v.totalPages === Math.max(1, Math.ceil(v.total / AUDIT_LIST_PAGE_SIZE)) && v.page <= v.totalPages
+    && items.length === Math.min(AUDIT_LIST_PAGE_SIZE, v.total - (v.page - 1) * AUDIT_LIST_PAGE_SIZE);
+}
+export function validAuditPeriods(v: unknown, cursor: unknown): v is AuditPeriod[] {
+  return Array.isArray(v) && v.length <= 50
+    && v.every(p => object(p) && text(p.id) && integer(p.sequence) && p.sequence > 0 && text(p.journalId) && text(p.status)
+      && ["startedAt", "endedAt", "debitedAt"].every(k => time(p[k])) && ["amountUnits", "serviceUnits", "returnedUnits", "compensationUnits"].every(k => units(p[k]))
+      && ["terminationRateBps", "commissionRateBps"].every(k => nullableInteger(p[k]) && (p[k] === null || (p[k] as number) <= 10000)))
+    && nullableInteger(cursor) && (cursor === null || cursor === v.at(-1)?.sequence);
+}
+export function validAuditEvents(v: unknown, cursor: unknown): v is AuditEvent[] {
+  return Array.isArray(v) && v.length <= 50
+    && v.every(e => object(e) && text(e.id) && text(e.action) && nullableText(e.actorEmail) && time(e.createdAt) && (e.note === null || typeof e.note === "string" && e.note.length <= 2000))
+    && nullableText(cursor) && (cursor === null || cursor === v.at(-1)?.id);
+}
 function validRecord(v: unknown): v is AuditRecord {
   return object(v) && text(v.id)
     && ["jobId", "installationId", "hostId", "buyerEmail", "providerEmail", "clientSubdomain", "hostIp", "countryCode", "contractId", "terminationId", "pricingModel", "renewalPolicy"].every(k => nullableText(v[k]))
@@ -52,14 +75,11 @@ function validRecord(v: unknown): v is AuditRecord {
     && AUDIT_STATUSES.includes(v.status as AuditRecord["status"]) && AUDIT_ATTENTION.includes(v.attention as AuditRecord["attention"])
     && ["not_required", "verified", "failed", "pending", "unknown"].includes(v.cleanupStatus as string)
     && ["order_snapshot", "historical_record"].includes(v.provenance as string) && typeof v.hostPresent === "boolean"
-    && (v.money === null || object(v.money) && AUDIT_MONEY_FIELDS.every(k => units((v.money as Record<string, unknown>)[k])));
+    && validAuditMoney(v.money);
 }
 export function parseAuditPage(v: unknown): AuditPage {
   if (!object(v) || !Array.isArray(v.items) || v.items.length > AUDIT_LIST_PAGE_SIZE || !v.items.every(validRecord)
-    || new Set(v.items.map(i => i.id)).size !== v.items.length || !integer(v.total) || !time(v.serverNow)
-    || v.pageSize !== AUDIT_LIST_PAGE_SIZE || !integer(v.page) || v.page < 1 || v.page > MAX_PAGE
-    || !integer(v.totalPages) || v.totalPages !== Math.max(1, Math.ceil(v.total / AUDIT_LIST_PAGE_SIZE)) || v.page > v.totalPages
-    || v.items.length !== Math.min(AUDIT_LIST_PAGE_SIZE, v.total - (v.page - 1) * AUDIT_LIST_PAGE_SIZE)) throw new Error("Invalid rental audit page");
+    || new Set(v.items.map(i => i.id)).size !== v.items.length || !validAuditPageEnvelope(v, v.items)) throw new Error("Invalid rental audit page");
   return v as AuditPage;
 }
 
@@ -68,16 +88,11 @@ export function parseAuditPageNumber(value: string, totalPages: number): number 
   const trimmed = value.trim();
   if (!/^[1-9]\d{0,9}$/.test(trimmed) || !integer(totalPages) || totalPages < 1) return null;
   const page = Number(trimmed);
-  return page <= Math.min(totalPages, MAX_PAGE) ? page : null;
+  return page <= Math.min(totalPages, AUDIT_MAX_PAGE) ? page : null;
 }
 export function parseAuditDetail(v: unknown, id: string): AuditDetail {
-  if (!object(v) || !validRecord(v.record) || v.record.id !== id || !Array.isArray(v.periods) || v.periods.length > 50
-    || !v.periods.every(p => object(p) && text(p.id) && integer(p.sequence) && p.sequence > 0 && text(p.journalId) && text(p.status)
-      && ["startedAt", "endedAt", "debitedAt"].every(k => time(p[k])) && ["amountUnits", "serviceUnits", "returnedUnits", "compensationUnits"].every(k => units(p[k]))
-      && ["terminationRateBps", "commissionRateBps"].every(k => nullableInteger(p[k]) && (p[k] === null || (p[k] as number) <= 10000)))
-    || !nullableInteger(v.periodsNextCursor) || v.periodsNextCursor !== null && v.periodsNextCursor !== v.periods.at(-1)?.sequence
-    || !Array.isArray(v.events) || v.events.length > 50 || !v.events.every(e => object(e) && text(e.id) && text(e.action) && nullableText(e.actorEmail) && time(e.createdAt) && (e.note === null || typeof e.note === "string" && e.note.length <= 2000))
-    || !nullableText(v.eventsNextCursor) || v.eventsNextCursor !== null && v.eventsNextCursor !== v.events.at(-1)?.id
+  if (!object(v) || !validRecord(v.record) || v.record.id !== id
+    || !validAuditPeriods(v.periods, v.periodsNextCursor) || !validAuditEvents(v.events, v.eventsNextCursor)
     || !integer(v.trialConsumedSeconds) || !time(v.serverNow)
     || !(v.settlement === null || object(v.settlement) && ["heldUnits", "returnedUnits", "compensationUnits"].every(k => units((v.settlement as Record<string, unknown>)[k]))
       && text(v.settlement.reason) && text(v.settlement.responsibility) && time(v.settlement.cutoffAt) && nullableTime(v.settlement.cleanupConfirmedAt))) throw new Error("Invalid rental audit detail");
@@ -98,7 +113,7 @@ export function auditFiltersFromDates(value: AuditFilters & { startDate?: string
 }
 const ROOT = "/v1/admin/client-market/rental-audit";
 export async function getRentalAudit(filters: AuditFilters, page = 1, signal?: AbortSignal) {
-  if (!Number.isInteger(page) || page < 1 || page > MAX_PAGE) throw new Error("Invalid rental audit page number");
+  if (!Number.isInteger(page) || page < 1 || page > AUDIT_MAX_PAGE) throw new Error("Invalid rental audit page number");
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) if (value?.trim()) query.set(key, value.trim());
   query.set("page", String(page));

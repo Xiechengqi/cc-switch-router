@@ -28,8 +28,6 @@ export const clientRentalsMessagesEn = {
   "clientRentals.discussion": "Discuss / review termination",
   "clientRentals.periodAmount": "Charged {amount} · returned {returned}",
   "clientRentals.trial": "Trial used {used}s · remaining {remaining}s",
-  "clientRentals.auditExpand": "Expand rental audit",
-  "clientRentals.auditCollapse": "Collapse rental audit",
 } as const;
 export const clientRentalsMessagesZh: Record<keyof typeof clientRentalsMessagesEn, string> = {
   "clientRentals.current": "进行中的租用",
@@ -61,6 +59,4 @@ export const clientRentalsMessagesZh: Record<keyof typeof clientRentalsMessagesE
   "clientRentals.discussion": "沟通／查看退租处理",
   "clientRentals.periodAmount": "实扣 {amount} · 已返还 {returned}",
   "clientRentals.trial": "试用已用 {used} 秒 · 剩余 {remaining} 秒",
-  "clientRentals.auditExpand": "展开全站租用审计",
-  "clientRentals.auditCollapse": "收起全站租用审计",
 };

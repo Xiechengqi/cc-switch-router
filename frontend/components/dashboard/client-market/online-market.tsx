@@ -4,8 +4,13 @@
  * seller inventory) and composes the pieces:
  *   - MyClientRentals: the buyer's running rentals, on top;
  *   - ShopCatalog + useClientCheckout: browse and rent;
- *   - SellerWorkspace: listed, rented out and past rentals.
+ *   - SellerWorkspace: listed, rented out and past rentals;
+ *   - ClientRentalAuditPanel: the Router owner's audit of every rental.
  * After an order the buyer stays here and the new rental card is highlighted.
+ *
+ * Tabs follow the Share market: "My listings" appears only for users who sell
+ * (the server's seller summary says so), "Rental audit" only for the Router
+ * owner. A link to a tab the viewer may not see falls back to the catalog.
  */
 import * as React from "react";
 import { Button, toast } from "@heroui/react";
@@ -14,6 +19,7 @@ import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { getClientSellerSummary, type ClientSellerSummary } from "@/lib/client-seller-summary";
 import type { ClientTerminationHostSummary } from "@/lib/client-termination";
 import {
   getOnlineListings,
@@ -23,8 +29,9 @@ import {
 } from "@/lib/online-client-market";
 import { currentPageHref } from "@/lib/url-search";
 import { useClientCheckout } from "./client-checkout";
-import { clientMarketWorkspaceFromQuery } from "./host-utils";
+import { clientMarketWorkspaceFromQuery, type ClientMarketWorkspace } from "./host-utils";
 import { MyClientRentals } from "./my-rentals";
+import { ClientRentalAuditPanel } from "./rental-audit-panel";
 import { SellerWorkspace } from "./seller-workspace";
 import { ShopCatalog } from "./shop-catalog";
 
@@ -40,28 +47,40 @@ type MarketProps = {
   providerId?: string;
   terminations: ReadonlyMap<string, ClientTerminationHostSummary>;
   onTerminationOpen: (id: string) => void;
+  /** Bumps when a termination changes, so an open audit detail rereads. */
+  auditRevision?: number;
   providerNotice?: React.ReactNode;
 };
 
 export function OnlineClientMarket(props: MarketProps) {
   const { session, loading } = useAuth();
   if (loading) return null;
-  return <OnlineMarketView key={session?.user?.id || "guest"} authenticated={!!session?.authenticated} {...props} />;
+  return (
+    <OnlineMarketView
+      key={session?.user?.id || "guest"}
+      authenticated={!!session?.authenticated}
+      canAudit={!!session?.authenticated && session.canAuditClientMarket === true}
+      {...props}
+    />
+  );
 }
 
 function OnlineMarketView({
   authenticated,
+  canAudit,
   providerId,
   focusId,
   terminations,
   onTerminationOpen,
+  auditRevision = 0,
   providerNotice,
-}: MarketProps & { authenticated: boolean }) {
+}: MarketProps & { authenticated: boolean; canAudit: boolean }) {
   const searchParams = useSearchParams();
   const { t } = useLocaleText();
   const [list, setList] = React.useState<OnlineListing[]>([]);
   const [sellerItems, setSellerItems] = React.useState<OnlineSellerItem[]>([]);
-  const [workspace, setWorkspace] = React.useState<"catalog" | "selling">(() =>
+  const [sellerSummary, setSellerSummary] = React.useState<ClientSellerSummary | null>(null);
+  const [workspace, setWorkspace] = React.useState<ClientMarketWorkspace>(() =>
     clientMarketWorkspaceFromQuery(searchParams.get("view"), searchParams.get("tab")),
   );
   const [addListingOpen, setAddListingOpen] = React.useState(searchParams.get("add") === "1");
@@ -74,29 +93,44 @@ function OnlineMarketView({
   const [newLease, setNewLease] = React.useState<string | null>(null);
   const reload = React.useCallback(() => setVersion((value) => value + 1), []);
 
+  // Until the summary arrives, a seller's link to "My listings" keeps the tab,
+  // so the page neither flickers nor drops the seller back to the catalog.
+  const sellingKnown = !authenticated || sellerSummary !== null;
+  const canSell = authenticated && sellerSummary?.canSell === true;
+  const showSelling = canSell || (!sellingKnown && workspace === "selling");
+  const view: ClientMarketWorkspace =
+    (workspace === "selling" && !showSelling) || (workspace === "audit" && !canAudit) ? "catalog" : workspace;
+
   React.useEffect(() => {
     const control = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     const selling = authenticated && workspace === "selling";
+    // The audit tab has its own reads; the shop and inventory pause meanwhile.
+    const shopping = workspace !== "audit";
     if (!selling) setSellerLoaded(false);
     const read = async () => {
       // Each source fails on its own: an inventory error never freezes the shop.
-      const [shop, seller] = await Promise.allSettled([
-        getOnlineListings(control.signal),
+      const [shop, seller, summary] = await Promise.allSettled([
+        shopping ? getOnlineListings(control.signal) : Promise.resolve(null),
         selling
           ? onlineRequest<{ items: OnlineSellerItem[] }>("seller-inventory", "GET", undefined, control.signal)
           : Promise.resolve({ items: [] as OnlineSellerItem[] }),
+        authenticated ? getClientSellerSummary(control.signal) : Promise.resolve(null),
       ]);
       if (control.signal.aborted) return;
-      if (shop.status === "fulfilled") setList(shop.value.listings.filter((listing) => !providerId || listing.providerId === providerId));
+      if (shop.status === "fulfilled" && shop.value) {
+        setList(shop.value.listings.filter((listing) => !providerId || listing.providerId === providerId));
+      }
       if (seller.status === "fulfilled") {
         setSellerItems(seller.value.items);
         if (selling) setSellerLoaded(true);
       }
+      // A failed summary keeps the last answer; it only decides tab visibility.
+      if (summary.status === "fulfilled" && summary.value) setSellerSummary(summary.value);
       const failed = [shop, seller].find((result) => result.status === "rejected");
       setError(failed?.status === "rejected" ? (failed.reason instanceof Error ? failed.reason.message : String(failed.reason)) : "");
-      setLoaded(true);
-      timer = setTimeout(() => void read(), LISTING_POLL_MS);
+      if (shopping) setLoaded(true);
+      if (shopping) timer = setTimeout(() => void read(), LISTING_POLL_MS);
     };
     void read();
     return () => {
@@ -127,41 +161,56 @@ function OnlineMarketView({
   }
   const checkout = useClientCheckout({ listings: list, authenticated, onReceipt: showReceipt });
 
-  const selectWorkspace = (next: "catalog" | "selling") => {
+  const selectWorkspace = React.useCallback((next: ClientMarketWorkspace) => {
     setWorkspace(next);
     updateMarketSearch((params) => {
       params.delete("tab");
-      if (next === "selling") params.set("view", "selling");
-      else if (params.get("view") === "selling") params.delete("view");
+      if (next === "catalog") params.delete("view");
+      else params.set("view", next);
     });
-  };
+  }, []);
+  // A tab the viewer may not see falls back to the catalog, in state and URL.
+  // A deep link to add a listing is dropped with it.
   React.useEffect(() => {
-    if (!authenticated && workspace === "selling") selectWorkspace("catalog");
-  }, [authenticated, workspace]);
+    if (view === workspace) return;
+    selectWorkspace("catalog");
+    if (workspace === "selling") {
+      setAddListingOpen(false);
+      updateMarketSearch((params) => {
+        params.delete("add");
+        params.delete("installation");
+      });
+    }
+  }, [view, workspace, selectWorkspace]);
+
+  const workspaceItems: Array<{ id: ClientMarketWorkspace; label: string }> = [
+    { id: "catalog", label: t("clientMarket.shop.catalog") },
+    ...(showSelling ? [{ id: "selling" as const, label: t("clientMarket.shop.selling") }] : []),
+    ...(canAudit ? [{ id: "audit" as const, label: t("rentalAudit.tab") }] : []),
+  ];
 
   return (
     <section className="grid min-w-0 gap-5" aria-label={t("online.supply")}>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
         {authenticated ? (
           <SegmentedControl
-            value={workspace}
+            value={view}
             onChange={selectWorkspace}
             ariaLabel={t("clientMarket.shop.workspaceLabel")}
             size="sm"
-            items={[
-              { id: "catalog", label: t("clientMarket.shop.catalog") },
-              { id: "selling", label: t("clientMarket.shop.selling") },
-            ]}
+            items={workspaceItems}
           />
         ) : (
           <h2 className="text-sm font-semibold text-foreground">{t("clientMarket.shop.catalog")}</h2>
         )}
-        <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={!loaded} onPress={reload}>
-          {!loaded ? <Loader2 className="size-4 animate-spin motion-reduce:animate-none" /> : <RefreshCw className="size-4" />}
-        </Button>
+        {view !== "audit" ? (
+          <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={!loaded} onPress={reload}>
+            {!loaded ? <Loader2 className="size-4 animate-spin motion-reduce:animate-none" /> : <RefreshCw className="size-4" />}
+          </Button>
+        ) : null}
       </div>
-      {checkout.pendingBanner}
-      {error ? (
+      {view !== "audit" ? checkout.pendingBanner : null}
+      {error && view !== "audit" ? (
         <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
           {error}
           <Button size="sm" variant="ghost" className="min-h-11" onPress={reload}>
@@ -169,7 +218,9 @@ function OnlineMarketView({
           </Button>
         </div>
       ) : null}
-      {workspace === "selling" && authenticated ? (
+      {view === "audit" ? (
+        <ClientRentalAuditPanel onTerminationOpen={onTerminationOpen} revision={auditRevision} />
+      ) : view === "selling" ? (
         <SellerWorkspace
           listings={list}
           items={sellerItems}

@@ -11,6 +11,7 @@ import { catalogNeedsRuntimeSync } from "@/components/dashboard/share-market/buy
 import { shareMarketMutationError } from "@/components/dashboard/share-market/market-utils";
 import { mergeShareMarketSubscriptionPage, subscriptionsNeedGrantPolling } from "@/components/dashboard/share-market/subscription-utils";
 import { ShareMarketOwnerWorkspace } from "@/components/dashboard/share-market/owner-workspace";
+import { ShareRentalAuditPanel } from "@/components/dashboard/share-market/rental-audit-panel";
 import { ShareTerminationDialog } from "@/components/market/share-termination-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -29,14 +30,17 @@ import type {
 import { replaceCurrentSearch } from "@/lib/url-search";
 import { useLoginContextKey } from "@/lib/use-login-context";
 
-type Workspace = "catalog" | "selling";
-type LoadScope = Workspace | "all";
+// "audit" is the Router owner's rental audit; it reads its own data, so the
+// market loads and polls nothing while it is open.
+type Workspace = "catalog" | "selling" | "audit";
+type LoadScope = "catalog" | "selling" | "all";
 const SHARE_MARKET_POLL_MS = 15_000;
 const SHARE_MARKET_GRANT_POLL_MS = 2_000;
 const SHARE_MARKET_RUNTIME_SYNC_POLL_MS = 3_000;
 
 function workspaceFromQuery(value: string | null): Workspace {
   if (value === "selling" || value === "mine") return "selling";
+  if (value === "audit") return "audit";
   return "catalog";
 }
 
@@ -290,7 +294,7 @@ export function ShareMarketWorkspace() {
   const runtimeSyncPolling = workspace === "catalog"
     && catalogNeedsRuntimeSync(catalog?.listings ?? []);
   React.useEffect(() => {
-    if (authLoading) return;
+    if (authLoading || workspace === "audit") return;
     const tick = () => {
       if (document.visibilityState !== "visible" || pausePolling) return;
       void load({ scope: workspace, silent: true, skipIfBusy: true });
@@ -316,7 +320,7 @@ export function ShareMarketWorkspace() {
     if (!authed && next !== "catalog") return;
     setWorkspaceState(next);
     replaceWorkspaceQuery(next);
-    void load({ scope: next });
+    if (next !== "audit") void load({ scope: next });
   };
 
   const actorDataCurrent = !authLoading && loadedActorKey === actorKey;
@@ -329,6 +333,16 @@ export function ShareMarketWorkspace() {
   const visibleSubscriptionHistoryTotal = actorDataCurrent ? subscriptionHistoryTotal : 0;
   const hasOwnedShares = (visibleOwnedShareCount ?? 0) > 0;
   const showSellingTab = authed && hasOwnedShares;
+  // Only the Router owner (router_owner_email, not isAdmin); the server re-checks.
+  const showAuditTab = authed && session?.canAuditClientMarket === true;
+  const [auditRevision, setAuditRevision] = React.useState(0);
+
+  React.useEffect(() => {
+    if (authLoading || workspace !== "audit" || showAuditTab) return;
+    setWorkspaceState("catalog");
+    replaceWorkspaceQuery("catalog");
+    void load({ scope: "catalog" });
+  }, [authLoading, load, showAuditTab, workspace]);
 
   React.useEffect(() => {
     if (workspace !== "selling" || visibleOwnedShareCount == null || hasOwnedShares) return;
@@ -341,12 +355,13 @@ export function ShareMarketWorkspace() {
     ...(showSellingTab
       ? [{ id: "selling" as const, label: t("shareMarket.workspace.selling") }]
       : []),
+    ...(showAuditTab ? [{ id: "audit" as const, label: t("rentalAudit.tab") }] : []),
   ];
-  const workspaceValue = workspace === "selling" && !showSellingTab ? "catalog" : workspace;
+  const workspaceValue = (workspace === "selling" && !showSellingTab) || (workspace === "audit" && !showAuditTab) ? "catalog" : workspace;
 
   return (
     <main className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
-      <ShareTerminationDialog selection={authed && linkedTermination ? { id: linkedTermination } : null} onClose={() => { setLinkedTermination(null); replaceCurrentSearch(params => params.delete("terminationId")); }} onChanged={() => { void load({ scope: workspace, silent: true }); }} />
+      <ShareTerminationDialog selection={authed && linkedTermination ? { id: linkedTermination } : null} onClose={() => { setLinkedTermination(null); replaceCurrentSearch(params => params.delete("terminationId")); }} onChanged={() => { setAuditRevision((value) => value + 1); if (workspace !== "audit") void load({ scope: workspace, silent: true }); }} />
       <h1 className="sr-only">{t("shareMarket.title")}</h1>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
         {authed ? (
@@ -363,11 +378,13 @@ export function ShareMarketWorkspace() {
             <p className="mt-0.5 text-xs text-slate-500">{t("shareMarket.catalog.subtitle")}</p>
           </div>
         )}
-        <div className="flex items-center justify-end gap-2">
-          <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load({ scope: workspace })}>
-            <RefreshCw className={loading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-          </Button>
-        </div>
+        {workspaceValue !== "audit" ? (
+          <div className="flex items-center justify-end gap-2">
+            <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load({ scope: workspaceValue === "selling" ? "selling" : "catalog" })}>
+              <RefreshCw className={loading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       {loading && !visibleCatalog && workspace === "catalog" ? (
@@ -376,7 +393,7 @@ export function ShareMarketWorkspace() {
           {t("shareMarket.loading")}
         </div>
       ) : null}
-      {error ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
+      {error && workspaceValue !== "audit" ? <p className="border-l-2 border-rose-400 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
 
       {visibleCatalog && workspace === "catalog" ? (
         <ShareMarketBuyerCatalog
@@ -407,6 +424,12 @@ export function ShareMarketWorkspace() {
           onChanged={() => load({ scope: "selling", silent: true })}
           onInteractionChange={setPausePolling}
           showHeading={false}
+        />
+      ) : null}
+      {showAuditTab && workspaceValue === "audit" ? (
+        <ShareRentalAuditPanel
+          onTerminationOpen={(id) => setLinkedTermination(id)}
+          revision={auditRevision}
         />
       ) : null}
     </main>

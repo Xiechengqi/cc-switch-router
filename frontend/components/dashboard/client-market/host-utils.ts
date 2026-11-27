@@ -5,10 +5,13 @@ export const CLIENT_MARKET_POLL_MS = 20_000;
 
 export const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 
-export type ClientMarketWorkspace = "catalog" | "selling";
+export type ClientMarketWorkspace = "catalog" | "selling" | "audit";
 
+/** The requested tab. Whether the viewer may see it is decided later, once the
+ * seller summary and session capability are known. */
 export function clientMarketWorkspaceFromQuery(view: string | null, tab: string | null): ClientMarketWorkspace {
   if (view === "selling" || tab === "mine") return "selling";
+  if (view === "audit") return "audit";
   return "catalog";
 }
 

@@ -9,6 +9,7 @@ test("seller and rental links select their workspace", () => {
   assert.equal(clientMarketWorkspaceFromQuery(null, "mine"), "selling");
   assert.equal(clientMarketWorkspaceFromQuery("rentals", null), "catalog");
   assert.equal(clientMarketWorkspaceFromQuery(null, null), "catalog");
+  assert.equal(clientMarketWorkspaceFromQuery("audit", null), "audit");
   assert.equal(clientMarketTenantFromQuery("rentals", null), true);
   assert.equal(clientMarketTenantFromQuery(null, "rental-1"), true);
   assert.equal(clientMarketTenantFromQuery("selling", null), false);

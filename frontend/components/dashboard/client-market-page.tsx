@@ -6,7 +6,6 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { OnlineClientMarket } from "@/components/dashboard/client-market/online-market";
-import { ClientRentalAuditPanel } from "@/components/dashboard/client-market/rental-audit-panel";
 import { clientMarketTenantHref } from "@/lib/dashboard-nav";
 import { ClientTerminationDialog } from "@/components/market/client-termination-dialog";
 import { useClientTerminationWorkspace } from "@/components/market/use-client-termination-workspace";
@@ -84,6 +83,7 @@ export function ClientMarketPage() {
         providerId={providerId}
         terminations={terminations}
         onTerminationOpen={openTermination}
+        auditRevision={terminationWork.revision}
         providerNotice={providerId ? (
           <div className="flex min-h-11 min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
             <span className="min-w-0 text-slate-700">{t("providers.marketFilter.client")}</span>
@@ -105,7 +105,6 @@ export function ClientMarketPage() {
         </div>
       ) : null}
       <ClientTerminationDialog terminationId={terminationId} onClose={closeTermination} onChanged={() => void terminationWork.refresh(true)} />
-      <ClientRentalAuditPanel onTerminationOpen={openTermination} revision={terminationWork.revision} />
     </main>
   );
 }

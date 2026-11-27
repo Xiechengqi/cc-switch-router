@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { Button } from "@heroui/react";
 import { Globe2, Plus, Search, X } from "lucide-react";
 import { formatAgeDaysOrHours } from "@/components/dashboard/share-dashboard-utils";
 import { CountryFlag } from "@/components/common/country-flag";
@@ -425,6 +426,11 @@ export function OnlineClientCard({
   );
 }
 
+/**
+ * The "Listed" row on My listings. It copies the Share owner toolbar
+ * (`MarketListingFilters` with a leading heading) class for class, so both
+ * markets' seller views read as one product.
+ */
 export function OnlineSellingToolbar({
   listedCount,
   query,
@@ -439,12 +445,12 @@ export function OnlineSellingToolbar({
   const { t } = useLocaleText();
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-2">
-      <h3 className="shrink-0 whitespace-nowrap font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+      <h3 className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-slate-500">
         {t("clientMarket.shop.filter.listed")}
-        <span className="ml-1.5 tabular-nums">{listedCount}</span>
+        {listedCount ? <span className="ml-1.5 tabular-nums text-slate-400">{listedCount}</span> : null}
       </h3>
-      <label className="flex h-11 w-44 shrink-0 grow items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 text-sm shadow-sm focus-within:ring-2 focus-within:ring-accent sm:ml-auto sm:grow-0">
-        <Search className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+      <label className="ml-auto flex h-9 w-44 shrink-0 grow items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-sm shadow-sm hover:border-slate-300 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary sm:grow-0">
+        <Search className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
         <input
           aria-label={t("clientMarket.shop.sellingSearch")}
           value={query}
@@ -453,19 +459,22 @@ export function OnlineSellingToolbar({
           onChange={(event) => onQuery(event.target.value)}
         />
         {query ? (
-          <button type="button" aria-label={t("common.reset")} className={cn("-mr-2 inline-flex size-10 items-center justify-center rounded", focusRing)} onClick={() => onQuery("")}>
-            <X className="size-3.5 text-muted-foreground" aria-hidden />
+          <button
+            type="button"
+            aria-label={t("common.reset")}
+            className="rounded active:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            onClick={() => onQuery("")}
+          >
+            <X className="h-3.5 w-3.5 text-slate-400" aria-hidden />
           </button>
         ) : null}
       </label>
-      <button
-        type="button"
-        className={cn("inline-flex h-11 shrink-0 items-center gap-1 rounded-xl bg-gradient-to-r from-accent to-[#4D7CFF] px-3 text-xs font-semibold text-white shadow-sm transition-all duration-200 hover:brightness-110 active:scale-[0.98]", focusRing)}
-        onClick={onAdd}
-      >
-        <Plus className="size-4" aria-hidden />
-        {t("clientMarket.shop.listAdd")}
-      </button>
+      <div className="shrink-0">
+        <Button size="sm" variant={listedCount ? "outline" : "primary"} className="h-9 shrink-0" onClick={onAdd}>
+          <Plus className="h-4 w-4" aria-hidden />
+          {t("clientMarket.shop.listAdd")}
+        </Button>
+      </div>
     </div>
   );
 }

@@ -183,7 +183,7 @@ export function ShopCatalog({
           className="grid gap-3"
           aria-label={country ? t("clientMarket.shop.hostListLabel", { name: countryName(country) }) : t("clientMarket.shop.cardGrid")}
         >
-          <p className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
             {t("clientMarket.shop.resultCount", { count: visible.length })}
           </p>
           <div className={ONLINE_CLIENT_CARD_GRID_CLASS}>
@@ -234,7 +234,8 @@ function ClientDetailDrawer({
   const terms = listing ? priceOf(listing) : null;
   const availability = listing ? onlineListingAvailability(listing) : "unavailable";
   const section = "grid gap-2";
-  const label = "font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground";
+  // Same as the Share seat drawer headings (buyer-catalog.tsx).
+  const label = "text-xs font-semibold uppercase text-slate-500";
   return (
     <Drawer.Backdrop isOpen={!!listing} onOpenChange={(open) => !open && onClose()}>
       <Drawer.Content placement="right">

@@ -460,6 +460,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         132,
         include_str!("../schema/0132_client_identity_and_offline_unlisting.sql"),
     ),
+    (133, include_str!("../schema/0133_share_market_rental_audit.sql")),
 ];
 
 pub fn apply(conn: &Connection) -> Result<(), AppError> {
@@ -1089,7 +1090,7 @@ mod tests {
     // Migration 126 adds the year-long Host health day aggregate.
     // Migration 127 adds seven online leasing tables and removes obsolete SSH operations.
     // Migration 132 adds the durable Client identity and audited identity alias tables.
-    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 298;
+    const CURRENT_SCHEMA_TABLE_COUNT: i64 = 299;
 
     #[test]
     fn migration_114_revokes_existing_sessions_and_rotation_grace_only_once() {

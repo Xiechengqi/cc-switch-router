@@ -21,10 +21,10 @@ mod tests;
 
 const LIST_PAGE_SIZE: i64 = 5;
 const DETAIL_PAGE_SIZE: usize = 50;
-fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
+pub(crate) fn db_error(context: &'static str) -> impl FnOnce(crate::db::Error) -> AppError {
     move |error| AppError::Internal(format!("{context} failed: {error}"))
 }
-fn utc(value: &str) -> Result<String, AppError> {
+pub(crate) fn utc(value: &str) -> Result<String, AppError> {
     DateTime::parse_from_rfc3339(value)
         .map(|v| {
             v.with_timezone(&Utc)
@@ -40,7 +40,7 @@ pub fn router() -> Router<ServerState> {
         .merge(personal::router())
         .layer(axum::middleware::from_fn(private_response))
 }
-fn no_store() -> [(header::HeaderName, &'static str); 1] {
+pub(crate) fn no_store() -> [(header::HeaderName, &'static str); 1] {
     [(header::CACHE_CONTROL, "private, no-store")]
 }
 
@@ -145,7 +145,7 @@ const LIFECYCLE: &str = "facts AS (
  FROM lifecycle
 ) ";
 
-fn text_filter(value: Option<&str>) -> Result<Option<String>, AppError> {
+pub(crate) fn text_filter(value: Option<&str>) -> Result<Option<String>, AppError> {
     let value = value.map(str::trim).filter(|v| !v.is_empty());
     if value.is_some_and(|v| v.len() > 254 || v.chars().any(char::is_control)) {
         return Err(AppError::BadRequest(
@@ -305,7 +305,7 @@ fn list_tx(conn: &Connection, q: &AuditQuery) -> Result<Value, AppError> {
     )
 }
 
-const MONEY_FIELDS: [&str; 9] = [
+pub(crate) const MONEY_FIELDS: [&str; 9] = [
     "chargedUnits",
     "returnedUnits",
     "unfulfilledUnits",

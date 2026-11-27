@@ -73,12 +73,19 @@ test("buyer receipts stay on the market page and the market gates Owner audit be
   assert.match(shared, /document.visibilityState === "visible"/);
   assert.match(shared, /!expanded/);
   assert.match(market, /revision=\{terminationWork.revision\}/);
+  // The audit is an owner-only tab: it reads only while mounted, remounts per
+  // account and aborts its reads when the owner leaves the tab.
   const audit = source("components/dashboard/client-market/rental-audit-panel.tsx");
   assert.match(audit, /session\.canAuditClientMarket === true/);
-  assert.match(audit, /\[expanded, setExpanded\] = React\.useState\(false\)/);
-  assert.match(audit, /if \(!active\) \{[\s\S]*?return;[\s\S]*?getRentalAudit\(/);
-  assert.match(audit, /request.current\?\.abort\(\); setRead\(null\); setSelected\(null\)/);
+  assert.match(audit, /<ClientAudit key=\{actor\}/);
+  const workspace = source("components/market/rental-audit-workspace.tsx");
+  assert.match(workspace, /return \(\) => controller\.abort\(\);/);
+  assert.doesNotMatch(workspace, /localStorage|sessionStorage/);
+  assert.doesNotMatch(market, /<ClientRentalAuditPanel/);
   const online = source("components/dashboard/client-market/online-market.tsx");
+  assert.match(online, /canAudit \? \[\{ id: "audit" as const/);
+  assert.match(online, /view === "audit" \? \([\s\S]*?<ClientRentalAuditPanel/);
+  assert.match(online, /showSelling \? \[\{ id: "selling" as const/);
   assert.match(online, /onReceipt: showReceipt/);
   assert.doesNotMatch(online, /router\.push/);
   assert.match(online, /<MyClientRentals revision=\{rentalRevision\} highlightId=\{newLease\}/);

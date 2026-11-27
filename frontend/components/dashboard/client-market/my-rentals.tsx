@@ -111,16 +111,10 @@ function Rentals({
   return (
     <section className="grid min-w-0 gap-3" aria-labelledby="my-clients-title">
       <div className="flex min-w-0 items-center gap-3">
-        <span className="inline-flex items-center gap-2 rounded-full border border-accent/30 bg-accent/5 px-3 py-1">
-          <span className="relative flex size-2" aria-hidden>
-            <span className="absolute inline-flex size-full animate-ping rounded-full bg-accent opacity-50 motion-reduce:animate-none" />
-            <span className="relative inline-flex size-2 rounded-full bg-accent" />
-          </span>
-          <h2 id="my-clients-title" className="font-mono text-xs uppercase tracking-[0.15em] text-accent">
-            {t("clientMarket.mine.title")}
-          </h2>
-        </span>
-        <span className="text-xs tabular-nums text-muted-foreground">{leases.length}</span>
+        <h2 id="my-clients-title" className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-slate-500">
+          {t("clientMarket.mine.title")}
+          <span className="ml-1.5 tabular-nums text-slate-400">{leases.length}</span>
+        </h2>
         <Link href={clientMarketTenantHref()} className={cn("ml-auto inline-flex min-h-11 items-center rounded px-1 text-xs font-medium text-accent hover:underline", focusRing)}>
           {t("clientMarket.mine.records")}
         </Link>

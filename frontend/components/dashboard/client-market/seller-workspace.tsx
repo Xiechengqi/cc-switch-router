@@ -287,10 +287,10 @@ export function SellerWorkspace({
       ) : null}
 
       {visibleRented.length ? (
-        <section className="grid gap-2 border-t border-border pt-5" aria-labelledby="client-seller-rented">
-          <h3 id="client-seller-rented" className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+        <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="client-seller-rented">
+          <h3 id="client-seller-rented" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
             {t("clientMarket.shop.filter.rented")}
-            <span className="ml-1.5 tabular-nums">{rented.length}</span>
+            <span className="ml-1.5 tabular-nums text-slate-400">{rented.length}</span>
           </h3>
           <div className={ONLINE_CLIENT_CARD_GRID_CLASS}>
             {visibleRented.map((item) => {
@@ -376,10 +376,10 @@ export function SellerWorkspace({
       ) : null}
 
       {history.length ? (
-        <section className="grid gap-2 border-t border-border pt-5" aria-labelledby="client-seller-history">
-          <h3 id="client-seller-history" className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+        <section className="grid gap-2 border-t border-slate-200 pt-5" aria-labelledby="client-seller-history">
+          <h3 id="client-seller-history" className="text-xs font-semibold uppercase tracking-wide text-slate-500">
             {t("lease.history")}
-            <span className="ml-1.5 tabular-nums">{history.length}</span>
+            <span className="ml-1.5 tabular-nums text-slate-400">{history.length}</span>
           </h3>
           <ExpandableRecordTable
             rows={history}
