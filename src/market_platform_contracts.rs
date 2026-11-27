@@ -4839,7 +4839,7 @@ mod tests {
     }
 
     #[test]
-    fn trial_only_is_share_only_capped_and_switchable_while_the_trial_runs() {
+    fn trial_only_is_capped_per_market_and_switchable_while_the_trial_runs() {
         let at = "2026-01-01T00:00:00+00:00";
         let conn = memory();
         let input = |n: usize, kind: &'static str| PrepareContract {
@@ -4853,7 +4853,13 @@ mod tests {
             trial_allowance_seconds: 3600,
             ..monthly("unused", false)
         };
-        assert!(prepare_contract_tx(&conn, &input(0, "client_host"), at).is_err());
+        // Client rentals may be trial-only too (migration 131), with their own
+        // cap of three that never borrows from or blocks the Share cap.
+        for n in 0..MAX_ACTIVE_TRIAL_ONLY as usize {
+            prepare_contract_tx(&conn, &input(20 + n, "client_host"), at).unwrap();
+        }
+        let client_over = prepare_contract_tx(&conn, &input(29, "client_host"), at).unwrap_err();
+        assert_eq!(client_over.code(), Some("CLIENT_TRIAL_ONLY_LIMIT"));
         assert!(
             prepare_contract_tx(
                 &conn,
