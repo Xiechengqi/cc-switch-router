@@ -51,7 +51,7 @@ export function UiUpdateNotice() {
         <p>{t("common.uiUpdated")}</p>
         <button
           type="button"
-          className="min-h-11 rounded-md bg-slate-900 px-3 text-sm font-medium text-white hover:bg-slate-800"
+          className="min-h-11 rounded-md border border-slate-300 bg-white text-slate-900 shadow-sm hover:border-slate-400 hover:bg-slate-50 active:bg-slate-100 px-3 text-sm font-medium"
           onClick={() => window.location.reload()}
         >
           {t("common.uiUpdatedAction")}

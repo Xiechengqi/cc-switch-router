@@ -161,7 +161,7 @@ export function CatalogSeatPreview({
         <button
           type="button"
           data-no-card-open
-          className="shrink-0 rounded-md bg-slate-900 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          className="shrink-0 rounded-md border border-slate-300 bg-white text-slate-900 shadow-sm hover:border-slate-400 hover:bg-slate-50 active:bg-slate-100 px-2 py-0.5 text-[10px] font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
           onClick={(event) => {
             event.stopPropagation();
             onRent();

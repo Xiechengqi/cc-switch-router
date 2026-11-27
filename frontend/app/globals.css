@@ -498,13 +498,21 @@ textarea:-webkit-autofill:focus {
   transform: none;
 }
 
-/* Buttons never take a blue fill (CLAUDE.md): the primary action is deep slate.
+/* Buttons never take a blue or black fill (CLAUDE.md): the primary action is
+   white with a firmer border than outline, so it still reads as the main step.
    Blue stays for links, focus rings and selected-state tints. */
 .button--primary {
-  --button-bg: rgb(var(--router-foreground));
-  --button-bg-hover: rgb(30 41 59);
-  --button-bg-pressed: rgb(51 65 85);
-  --button-fg: #ffffff;
+  --button-bg: rgb(var(--router-card));
+  --button-bg-hover: rgb(248 250 252);
+  --button-bg-pressed: rgb(241 245 249);
+  --button-fg: rgb(var(--router-foreground));
+  border: 1px solid rgb(203 213 225);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.button--primary:hover,
+.button--primary[data-hovered="true"] {
+  border-color: rgb(148 163 184);
 }
 
 .button--secondary,

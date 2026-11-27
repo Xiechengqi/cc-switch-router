@@ -78,7 +78,7 @@ export function ProviderStandingCard() {
         <div className="flex flex-wrap gap-2">
           <Link
             href={shareMarketHref({ workspace: "selling" })}
-            className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-slate-900 px-4 text-sm font-medium text-white outline-none transition-colors hover:bg-slate-800 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            className="inline-flex min-h-11 items-center gap-2 rounded-xl border border-slate-300 bg-white text-slate-900 shadow-sm hover:border-slate-400 hover:bg-slate-50 active:bg-slate-100 px-4 text-sm font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           >
             <Share2 className="h-4 w-4" aria-hidden="true" />
             {t("providerStanding.start.share")}

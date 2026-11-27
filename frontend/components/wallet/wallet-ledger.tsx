@@ -155,7 +155,7 @@ export function WalletLedger({
               onClick={() => choose(item)}
               className={cn(
                 "min-h-9 whitespace-nowrap rounded-full px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
-                filter === item ? "bg-foreground text-white" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                filter === item ? "bg-sky-100 font-semibold text-sky-800" : "text-muted-foreground hover:bg-muted hover:text-foreground",
               )}
             >
               {t(`walletPage.filter.${item}`)}

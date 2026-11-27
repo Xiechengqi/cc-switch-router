@@ -275,7 +275,7 @@ function RentalCard({
             target="_blank"
             rel="noopener noreferrer"
             className={cn(
-              "group inline-flex h-9 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition-colors hover:bg-slate-800 active:bg-slate-700",
+              "group inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-300 bg-white text-slate-900 shadow-sm hover:border-slate-400 hover:bg-slate-50 active:bg-slate-100 px-3 text-xs font-semibold transition-colors",
               focusRing,
             )}
             onClick={() => onStep("console", true)}

@@ -412,7 +412,7 @@ export function ClientOfferCard({
             aria-describedby={nameId}
             onClick={onRent}
             className={cn(
-              "inline-flex h-9 items-center rounded-lg px-3 text-xs font-semibold transition-colors disabled:opacity-60 bg-slate-900 text-white hover:bg-slate-800 active:bg-slate-700",
+              "inline-flex h-9 items-center rounded-lg px-3 text-xs font-semibold transition-colors disabled:opacity-60 border border-slate-300 bg-white text-slate-900 shadow-sm hover:border-slate-400 hover:bg-slate-50 active:bg-slate-100",
               focusRing,
             )}
           >

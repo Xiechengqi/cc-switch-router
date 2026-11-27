@@ -345,7 +345,7 @@ export function ClientListingAddDialog({
       return (
         <a
           className={
-            "inline-flex min-h-11 items-center gap-1.5 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-800 " +
+            "inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-slate-300 bg-white text-slate-900 shadow-sm hover:border-slate-400 hover:bg-slate-50 active:bg-slate-100 px-4 text-sm font-semibold " +
             focus
           }
           href={links[action]}

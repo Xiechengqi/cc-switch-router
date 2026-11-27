@@ -48,7 +48,7 @@ test("Client market buttons never use a blue fill and in-page controls stay at h
     assert.doesNotMatch(text, /\b(?:min-)?h-11\b/, `${file} in-page controls are h-9`);
   }
   const css = readFileSync(new URL("../../../app/globals.css", import.meta.url), "utf8");
-  assert.match(css, /\.button--primary \{\s*--button-bg: rgb\(var\(--router-foreground\)\);/);
+  assert.match(css, /\.button--primary \{\s*--button-bg: rgb\(var\(--router-card\)\);/);
   const catalog = readFileSync(new URL("./shop-catalog.tsx", import.meta.url), "utf8");
   assert.match(catalog, /continent === "all" \|\| continentOf\(shopCountryKey\(item\.country\)\) === continent/);
 });
