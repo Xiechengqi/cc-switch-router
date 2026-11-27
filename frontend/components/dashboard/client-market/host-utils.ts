@@ -162,6 +162,8 @@ export function sortShopCountries(
 }
 
 export const SHOP_BROWSE_KEY = "cc_switch_router_client_market_shop_browse_v1";
+/** Whether the shop shows the buyer's own rentals ("Mine") instead of the catalog. */
+export const SHOP_MINE_KEY = "cc_switch_router_client_market_shop_mine_v1";
 
 type ShopSortable = ShopAvailabilityFields & {
   installationId: string;

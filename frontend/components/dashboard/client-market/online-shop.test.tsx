@@ -121,8 +121,9 @@ test("Share catalog: All sits right of Mine, history only under Mine, seller his
   const filters = read("../share-market/market-listing-filters.tsx");
   assert.match(filters, /shareMarket\.catalog\.mine[\s\S]*?shareMarket\.catalog\.all/);
   const buyer = read("../share-market/buyer-catalog.tsx");
-  assert.match(buyer, /mineEnabled=\{authed && \(rentedShareIds\.size > 0 \|\| historyCount > 0\)\}/);
-  assert.match(buyer, /\{authed && mine \? \(\s*<AccountShareRentals\s+historyOnly/);
+  assert.match(buyer, /const mineEnabled = authed && \(rentedShareIds\.size > 0 \|\| historyCount > 0\);/);
+  assert.match(buyer, /mineEnabled=\{mineEnabled\}/);
+  assert.match(buyer, /\{mine \? \(\s*<AccountShareRentals\s+historyOnly/);
   assert.match(read("../share-market/owner-workspace.tsx"), /<ShareSellerRentalHistory\b/);
 });
 
@@ -134,4 +135,17 @@ test("continent and country counts follow the listings on screen, rented ones in
   assert.match(shop, /list\.reduce\(\(sum, card\) => sum \+ card\.total, 0\)/);
   assert.match(shop, /<span className=\{shopChipCount\(selected\)\}>\{card\.total\}<\/span>/);
   assert.doesNotMatch(shop, /\{card\.idle\}<\/span>|sum \+ card\.idle/);
+});
+
+test("both shops remember the \"Mine\" tab across a reload", () => {
+  const market = readFileSync(new URL("./online-market.tsx", import.meta.url), "utf8");
+  const buyer = readFileSync(new URL("../share-market/buyer-catalog.tsx", import.meta.url), "utf8");
+  assert.match(market, /const \[mineSelected, setMineSelected\] = usePersistentState\(SHOP_MINE_KEY, false\);/);
+  // Until the counts arrive a remembered "Mine" stays; a known-empty one falls back.
+  assert.match(market, /const mine = mineSelected && authenticated && \(rentalCounts === null \|\| mineEnabled\);/);
+  assert.match(buyer, /const \[mineChosen, setMine\] = usePersistentState\(SHARE_CATALOG_MINE_KEY, initialMine\);/);
+  // A `?view=rentals` link still opens "Mine" over a remembered "All".
+  assert.match(buyer, /if \(initialMine\) setMine\(true\);/);
+  // A remembered "Mine" with nothing behind it shows the catalog, without forgetting the choice.
+  assert.match(buyer, /const mine = mineChosen && mineEnabled;/);
 });

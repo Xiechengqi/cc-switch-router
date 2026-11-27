@@ -46,6 +46,7 @@ import type {
   ShareMarketSubscription,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import {
   activeSubscriptionForShare,
   formatSeatPrice,
@@ -78,6 +79,8 @@ import {
 import { useShareSeatCheckout } from "./share-seat-checkout";
 import { AccountShareRentals } from "@/components/dashboard/account-share-rentals";
 import { needsRentalAttention, partitionShareMarketSubscriptions } from "@/components/dashboard/share-market/subscription-utils";
+
+const SHARE_CATALOG_MINE_KEY = "cc_switch_router_share_market_catalog_mine_v1";
 
 type SeatCard = { listing: ShareMarketListing; seat: ShareMarketSeat };
 type SelectedListing = { listing: ShareMarketListing; seat?: ShareMarketSeat };
@@ -288,7 +291,11 @@ export function ShareMarketBuyerCatalog({
   const [query, setQuery] = React.useState("");
   const [owners, setOwners] = React.useState<string[]>([]);
   const [family, setFamily] = React.useState<ShareProviderCategory | "all">("all");
-  const [mine, setMine] = React.useState(initialMine);
+  // The "Mine" tab survives a reload; a `?view=rentals` link still opens it.
+  const [mineChosen, setMine] = usePersistentState(SHARE_CATALOG_MINE_KEY, initialMine);
+  React.useEffect(() => {
+    if (initialMine) setMine(true);
+  }, [initialMine, setMine]);
   const [idleOnly, setIdleOnly] = React.useState(false);
   const [sort, setSort] = React.useState<MarketCatalogSort>("recommended");
   const [page, setPage] = React.useState(1);
@@ -323,10 +330,21 @@ export function ShareMarketBuyerCatalog({
     () => mergeCatalogWithRentedListings(catalog.listings, authed ? rentedListings : []),
     [authed, catalog.listings, rentedListings],
   );
+  const { history } = React.useMemo(
+    () => partitionShareMarketSubscriptions(subscriptions),
+    [subscriptions],
+  );
+  const historyCount = Math.max(historyTotal ?? 0, history.length);
+  // "Mine" needs a signed-in buyer with something to show: a running rental
+  // or at least one finished one (its history is what "Mine" adds below).
+  const mineEnabled = authed && (rentedShareIds.size > 0 || historyCount > 0);
+  // A remembered "Mine" with nothing behind it (another account, or every
+  // rental gone) shows the full catalog without forgetting the choice.
+  const mine = mineChosen && mineEnabled;
   const filteredListings = React.useMemo(
     () => sortCatalogListings(
       filterMergedCatalogListings(mergedListings, {
-        mine: authed && mine,
+        mine,
         idleOnly,
         family,
         query,
@@ -338,17 +356,12 @@ export function ShareMarketBuyerCatalog({
       sort,
       catalog.recommendationMode,
     ),
-    [authed, catalog.recommendationMode, family, idleOnly, marketProviderId, mergedListings, mine, owners, query, rentedShareIds, sort, subscriptions],
+    [catalog.recommendationMode, family, idleOnly, marketProviderId, mergedListings, mine, owners, query, rentedShareIds, sort, subscriptions],
   );
   const paged = React.useMemo(
     () => paginateListings(filteredListings, page, MARKET_CATALOG_PAGE_SIZE),
     [filteredListings, page],
   );
-  const { history } = React.useMemo(
-    () => partitionShareMarketSubscriptions(subscriptions),
-    [subscriptions],
-  );
-  const historyCount = Math.max(historyTotal ?? 0, history.length);
 
   React.useEffect(() => {
     setPage((current) => Math.min(current, paged.pageCount));
@@ -466,11 +479,9 @@ export function ShareMarketBuyerCatalog({
         onFamilyChange={setFamily}
         onQueryChange={setQuery}
         onOwnersChange={setOwners}
-        mine={authed && mine}
+        mine={mine}
         mineCount={rentedShareIds.size}
-        // "Mine" needs a signed-in buyer with something to show: a running rental
-        // or at least one finished one (its history is what "Mine" adds below).
-        mineEnabled={authed && (rentedShareIds.size > 0 || historyCount > 0)}
+        mineEnabled={mineEnabled}
         onMineChange={setMine}
         idleOnly={idleOnly}
         onIdleOnlyChange={setIdleOnly}
@@ -506,7 +517,7 @@ export function ShareMarketBuyerCatalog({
         </div>
       ) : null}
       <MarketPagination page={paged.page} pageCount={paged.pageCount} onPageChange={setPage} />
-      {authed && mine ? (
+      {mine ? (
         <AccountShareRentals
           historyOnly
           historyPageSize={5}

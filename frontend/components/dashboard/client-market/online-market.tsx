@@ -29,8 +29,9 @@ import {
   type OnlineSellerItem,
 } from "@/lib/online-client-market";
 import { currentPageHref } from "@/lib/url-search";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import { useClientCheckout } from "./client-checkout";
-import { clientMarketWorkspaceFromQuery, type ClientMarketWorkspace } from "./host-utils";
+import { clientMarketWorkspaceFromQuery, SHOP_MINE_KEY, type ClientMarketWorkspace } from "./host-utils";
 import { MyClientRentals } from "./my-rentals";
 import { ClientRentalRecords } from "./rental-records";
 import { ClientRentalAuditPanel } from "./rental-audit-panel";
@@ -120,7 +121,8 @@ function OnlineMarketView({
   const [rentalRevision, setRentalRevision] = React.useState(0);
   const [newLease, setNewLease] = React.useState<string | null>(null);
   const reload = React.useCallback(() => setVersion((value) => value + 1), []);
-  const [mineSelected, setMineSelected] = React.useState(false);
+  // Remembered across reloads, like the shop's region and "rentable only".
+  const [mineSelected, setMineSelected] = usePersistentState(SHOP_MINE_KEY, false);
   const rentalCounts = useClientRentalCounts(authenticated, rentalRevision + version);
   const mineEnabled = authenticated && !!rentalCounts && rentalCounts.current + rentalCounts.history > 0;
   // Until the counts arrive, a chosen "Mine" stays; a known-empty one falls back.
